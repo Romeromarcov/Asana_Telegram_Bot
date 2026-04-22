@@ -1,0 +1,24 @@
+# ══════════════════════════════════════════════════════
+# EQUIPO — Agrega o quita personas aquí sin tocar bot.py
+# ══════════════════════════════════════════════════════
+# Formato de cada línea:
+#   telegram_id | asana_gid | nombre
+#
+# Para agregar alguien nuevo:
+#   1. Pídele que abra el bot y escriba /mi_id
+#   2. Consigue su GID en: https://app.asana.com/api/1.0/users?workspace=1145691884633083
+#   3. Agrega una línea aquí y reinicia el bot en Railway
+#
+# Para desactivar a alguien sin borrarlo, pon un # al inicio de su línea
+# ══════════════════════════════════════════════════════
+
+5269337388  | 1145691884287606 | Marco Vinicio (Manager)
+8650936398  | 1214167186224936 | Alexandra (Atención al Cliente)
+8427440193  | 1214167186224927 | Marcos Velasco (Administración)
+6303685785  | 1214167186224933 | Luis Laya (Almacén)
+7208904862  | 1214167186224921 | Melanie Reverón (Finanzas)
+
+5399960075  | 1214167186224930 | Ronald Cáseres (Supervisor Ventas)
+
+# ── Pendientes de agregar ──────────────────────────────
+# ????        | 1214167186224924 | Ventas 1 (lubrikca.ventas@gmail.com)
