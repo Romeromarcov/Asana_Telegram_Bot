@@ -565,6 +565,11 @@ async def handle_task_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("❌ Error al crear la tarea en Asana. Intenta de nuevo.")
         return ConversationHandler.END
 
+    # Registrar metadata de tarea única para calcular recordatorios dinámicos
+    today_str = datetime.now(TZ).strftime("%Y-%m-%d")
+    if not freq and due_on and task_gid:
+        register_unique_task(task_gid, today_str, due_on)
+
     # Guardar recurrencia custom (intraday, weekly, biweekly)
     if freq in ("intraday", "weekly", "biweekly"):
         rec_config = {
@@ -1161,15 +1166,234 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
 
     jq = app.job_queue
-    jq.run_daily(job_morning,      time(MORNING_HOUR,   MORNING_MIN,   tzinfo=TZ))
-    jq.run_daily(job_afternoon,    time(AFTERNOON_HOUR, AFTERNOON_MIN, tzinfo=TZ))
-    jq.run_daily(job_daily_report, time(REPORT_HOUR,    REPORT_MIN,    tzinfo=TZ))
-    jq.run_repeating(job_check_new_tasks,           interval=CHECK_INTERVAL_MINUTES * 60, first=10)
-    jq.run_repeating(job_process_recurring,         interval=60 * 30,  first=30)   # cada 30 min
-    jq.run_repeating(job_check_recurring_completed, interval=60 * 60,  first=60)   # cada hora
+    jq.run_daily(job_morning,        time(MORNING_HOUR,   MORNING_MIN,   tzinfo=TZ))
+    jq.run_daily(job_afternoon,      time(AFTERNOON_HOUR, AFTERNOON_MIN, tzinfo=TZ))
+    jq.run_daily(job_daily_report,   time(REPORT_HOUR,    REPORT_MIN,    tzinfo=TZ))
 
-    logger.info(f"✅ Bot Lubrikca v3.0 listo | Recordatorios: {MORNING_HOUR}:00 y {AFTERNOON_HOUR}:00 | Reporte: {REPORT_HOUR}:00")
+    # Escalación — corre junto a los recordatorios de mañana y tarde
+    jq.run_daily(job_escalation_am,  time(MORNING_HOUR,   MORNING_MIN,   tzinfo=TZ))
+    jq.run_daily(job_escalation_pm,  time(AFTERNOON_HOUR, AFTERNOON_MIN, tzinfo=TZ))
+
+    # Resúmenes de fin de semana (viernes y domingo a las 3pm)
+    jq.run_daily(job_friday_summary, time(AFTERNOON_HOUR, AFTERNOON_MIN, tzinfo=TZ))
+    jq.run_daily(job_sunday_summary, time(AFTERNOON_HOUR, AFTERNOON_MIN, tzinfo=TZ))
+
+    # Jobs de fondo
+    jq.run_repeating(job_check_new_tasks,           interval=CHECK_INTERVAL_MINUTES * 60, first=10)
+    jq.run_repeating(job_process_recurring,         interval=60 * 30, first=30)
+    jq.run_repeating(job_check_recurring_completed, interval=60 * 60, first=60)
+
+    logger.info(f"✅ Bot Lubrikca v4.0 listo | Recordatorios: {MORNING_HOUR}:00 y {AFTERNOON_HOUR}:00 | Reporte: {REPORT_HOUR}:00 | Escalación activa")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ESCALACIÓN AUTOMÁTICA v4.0
+# ══════════════════════════════════════════════════════════════════════════════
+
+from escalation import (
+    should_remind_before_due, should_escalate_overdue,
+    mark_alert_sent, is_task_blocked, block_task, cleanup_alert_state,
+    get_freq_for_task, days_until_due, hours_since_due,
+    register_unique_task, DAYS_LABEL,
+)
+
+async def job_escalation(context: ContextTypes.DEFAULT_TYPE, session: str = "pm"):
+    """
+    Corre 2 veces al día (mañana y tarde).
+    - Envía recordatorios anticipados al responsable
+    - Escala tareas vencidas al manager
+    session: 'am' | 'pm'
+    """
+    team     = load_team()
+    rec_data = load_recurring()
+    all_gids = set()
+
+    for tg_id, info in team.items():
+        if tg_id == MANAGER_CHAT_ID:
+            continue
+
+        try:
+            tasks = await get_pending_tasks(info["asana_gid"])
+        except Exception:
+            continue
+
+        for task in tasks:
+            gid    = task["gid"]
+            due_on = task.get("due_on")
+            freq   = get_freq_for_task(gid, rec_data)
+            all_gids.add(gid)
+
+            if not due_on:
+                continue
+
+            first_name = get_first_name(info["name"])
+
+            # ── Recordatorios anticipados al responsable ────────────────────
+            pre_alerts = should_remind_before_due(gid, due_on, freq, TZ)
+            for alert_key in pre_alerts:
+                days = days_until_due(due_on, TZ)
+                label = DAYS_LABEL.get(alert_key, f"{days} día(s)")
+                msg = (
+                    f"⏰ *Recordatorio, {first_name}*\n\n"
+                    f"📌 *{task['name']}*\n"
+                    f"📅 Vence en *{label}* ({due_on})\n\n"
+                    f"Recuerda completarla a tiempo."
+                )
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("📋 Ver mis tareas", callback_data="ver_tareas")
+                ]])
+                try:
+                    await context.bot.send_message(
+                        chat_id=tg_id, text=msg,
+                        reply_markup=keyboard, parse_mode="Markdown")
+                    mark_alert_sent(gid, alert_key)
+                    logger.info(f"Alerta anticipada '{alert_key}' → {info['name']}: {task['name']}")
+                except Exception as e:
+                    logger.error(f"Error alerta anticipada: {e}")
+
+            # ── Escalación por tarea vencida al manager ────────────────────
+            if is_task_blocked(gid):
+                continue
+
+            esc_key, should_block = should_escalate_overdue(gid, due_on, session, TZ)
+            if not esc_key:
+                continue
+
+            hours = hours_since_due(due_on, TZ) or 0
+
+            # Nivel de urgencia
+            if hours < 24:
+                icon = "⚠️"
+                level = "Tarea vencida"
+            elif hours < 48:
+                icon = "🚨"
+                level = "Vencida +24h — sin completar"
+            elif hours < 72:
+                icon = "🔴"
+                level = "URGENTE — Vencida +48h"
+            else:
+                icon = "⛔"
+                level = "CRÍTICO — Bloqueada +72h"
+
+            hours_int = int(hours)
+            time_str  = f"{hours_int}h" if hours_int > 0 else "recién vencida"
+
+            esc_msg = (
+                f"{icon} *{level}*\n\n"
+                f"📌 *{task['name']}*\n"
+                f"👤 {info['name']}\n"
+                f"📅 Venció: {due_on} (hace {time_str})\n"
+            )
+            if should_block:
+                esc_msg += "\n⛔ *Tarea bloqueada.* No se crearán nuevas recurrencias hasta que se complete."
+
+            keyboard_mgr = InlineKeyboardMarkup([[
+                InlineKeyboardButton(f"📋 Ver tareas de {get_first_name(info['name'])}",
+                                     callback_data="reporte")
+            ]])
+            try:
+                await context.bot.send_message(
+                    chat_id=MANAGER_CHAT_ID, text=esc_msg,
+                    reply_markup=keyboard_mgr, parse_mode="Markdown")
+                mark_alert_sent(gid, esc_key)
+                if should_block:
+                    block_task(gid)
+                logger.info(f"Escalación '{esc_key}' → manager: {info['name']} / {task['name']}")
+            except Exception as e:
+                logger.error(f"Error escalación: {e}")
+
+    cleanup_alert_state(all_gids)
+
+async def job_escalation_am(context: ContextTypes.DEFAULT_TYPE):
+    await job_escalation(context, session="am")
+
+async def job_escalation_pm(context: ContextTypes.DEFAULT_TYPE):
+    await job_escalation(context, session="pm")
+
+async def job_friday_summary(context: ContextTypes.DEFAULT_TYPE):
+    """Viernes tarde — resumen de pendientes para la semana siguiente."""
+    now = datetime.now(TZ)
+    if now.weekday() != 4:  # Solo viernes
+        return
+
+    team = load_team()
+    msg  = "📋 *Resumen del viernes — Pendientes para la semana*\n\n"
+    has_pending = False
+
+    for tg_id, info in team.items():
+        if tg_id == MANAGER_CHAT_ID:
+            continue
+        try:
+            tasks = await get_pending_tasks(info["asana_gid"])
+            if tasks:
+                has_pending = True
+                first_name  = get_first_name(info["name"])
+                # Enviar al responsable
+                task_msg = (
+                    f"📋 *Hola {first_name}, resumen del viernes*\n\n"
+                    f"Tienes *{len(tasks)}* tarea(s) pendiente(s) para la próxima semana:\n\n"
+                )
+                for i, t in enumerate(tasks, 1):
+                    due  = f" — _{t['due_on']}_" if t.get("due_on") else ""
+                    warn = " ⚠️" if is_overdue(t) else ""
+                    task_msg += f"{i}. *{t['name']}*{due}{warn}\n"
+                task_msg += "\n¡Que tengas buen fin de semana! 🎉"
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("📋 Ver mis tareas", callback_data="ver_tareas")
+                ]])
+                await context.bot.send_message(
+                    chat_id=tg_id, text=task_msg,
+                    reply_markup=keyboard, parse_mode="Markdown")
+
+                # Agregar al resumen del manager
+                od = sum(1 for t in tasks if is_overdue(t))
+                status = "🔴" if od > 0 else "🟡"
+                msg += f"{status} *{info['name']}* — {len(tasks)} pendiente(s)\n"
+                for t in tasks:
+                    due = f" _{t['due_on']}_" if t.get("due_on") else ""
+                    msg += f"   • {t['name']}{due}\n"
+                msg += "\n"
+        except Exception as e:
+            logger.error(f"Error resumen viernes {info['name']}: {e}")
+
+    if has_pending:
+        msg += "─────────────────\n_Resumen enviado a cada miembro del equipo._"
+        await context.bot.send_message(
+            chat_id=MANAGER_CHAT_ID, text=msg, parse_mode="Markdown")
+
+async def job_sunday_summary(context: ContextTypes.DEFAULT_TYPE):
+    """Domingo tarde — recordatorio de pendientes para la semana."""
+    now = datetime.now(TZ)
+    if now.weekday() != 6:  # Solo domingo
+        return
+
+    team = load_team()
+    for tg_id, info in team.items():
+        if tg_id == MANAGER_CHAT_ID:
+            continue
+        try:
+            tasks = await get_pending_tasks(info["asana_gid"])
+            if not tasks:
+                continue
+            first_name = get_first_name(info["name"])
+            msg = (
+                f"🌅 *Hola {first_name}, preparando la semana*\n\n"
+                f"Tienes *{len(tasks)}* tarea(s) pendiente(s):\n\n"
+            )
+            for i, t in enumerate(tasks, 1):
+                due  = f" — _{t['due_on']}_" if t.get("due_on") else ""
+                warn = " ⚠️" if is_overdue(t) else ""
+                msg += f"{i}. *{t['name']}*{due}{warn}\n"
+            msg += "\n¡Mañana empieza la semana con todo! 💪"
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("📋 Ver mis tareas", callback_data="ver_tareas")
+            ]])
+            await context.bot.send_message(
+                chat_id=tg_id, text=msg,
+                reply_markup=keyboard, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Error resumen domingo {info['name']}: {e}")
