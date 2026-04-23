@@ -1,6 +1,7 @@
 """
 Bot de Telegram para seguimiento de tareas de Asana — Lubrikca
 - Envía recordatorios 2 veces al día (mañana y tarde)
+- Detecta tareas nuevas en Asana y notifica al instante
 - Permite confirmar tareas completadas con /listo
 - Marca tareas como completadas en Asana
 - Envía reporte diario al manager
@@ -8,7 +9,6 @@ Bot de Telegram para seguimiento de tareas de Asana — Lubrikca
 """
 
 import os
-import asyncio
 import logging
 from datetime import datetime, time
 from pathlib import Path
@@ -34,8 +34,14 @@ AFTERNOON_MIN  = int(os.environ.get("AFTERNOON_MIN",  "0"))
 REPORT_HOUR    = int(os.environ.get("REPORT_HOUR",    "18"))
 REPORT_MIN     = int(os.environ.get("REPORT_MIN",     "0"))
 
+# Cada cuántos minutos revisa si hay tareas nuevas en Asana
+CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "5"))
+
 ASANA_BASE = "https://app.asana.com/api/1.0"
 TZ = pytz.timezone(TIMEZONE)
+
+# Memoria de tareas conocidas por usuario {asana_gid: set(task_gids)}
+known_tasks: dict[str, set] = {}
 
 # ── CARGA DEL EQUIPO DESDE team.txt ───────────────────────────────────────────
 
@@ -111,6 +117,50 @@ def format_task_list(tasks: list) -> str:
         warn = " ⚠️" if is_overdue(t) else ""
         lines.append(f"{i}. *{t['name']}*{due}{warn}")
     return "\n".join(lines)
+
+# ── DETECCIÓN DE TAREAS NUEVAS ─────────────────────────────────────────────────
+
+async def job_check_new_tasks(context: ContextTypes.DEFAULT_TYPE):
+    """Revisa cada X minutos si hay tareas nuevas asignadas y notifica al instante."""
+    team = load_team()
+    for tg_id, info in team.items():
+        if tg_id == MANAGER_CHAT_ID:
+            continue
+        asana_gid = info["asana_gid"]
+        try:
+            current_tasks = await get_pending_tasks(asana_gid)
+            current_gids = {t["gid"] for t in current_tasks}
+
+            # Primera vez que vemos a este usuario: guardamos sus tareas actuales sin notificar
+            if asana_gid not in known_tasks:
+                known_tasks[asana_gid] = current_gids
+                logger.info(f"Tareas iniciales cargadas para {info['name']}: {len(current_gids)}")
+                continue
+
+            # Detectar tareas nuevas (que no estaban antes)
+            new_gids = current_gids - known_tasks[asana_gid]
+            new_tasks = [t for t in current_tasks if t["gid"] in new_gids]
+
+            if new_tasks:
+                first_name = info["name"].split()[0]
+                for task in new_tasks:
+                    due = f"\n📅 Vence: *{task['due_on']}*" if task.get("due_on") else ""
+                    msg = (
+                        f"🔔 *¡Nueva tarea asignada, {first_name}!*\n\n"
+                        f"📌 *{task['name']}*{due}\n\n"
+                        f"Cuando la completes, responde:\n`/listo` para ver tu lista"
+                    )
+                    try:
+                        await context.bot.send_message(chat_id=tg_id, text=msg, parse_mode="Markdown")
+                        logger.info(f"Nueva tarea notificada a {info['name']}: {task['name']}")
+                    except Exception as e:
+                        logger.error(f"Error notificando a {tg_id}: {e}")
+
+            # Actualizar memoria
+            known_tasks[asana_gid] = current_gids
+
+        except Exception as e:
+            logger.error(f"Error revisando tareas de {info['name']}: {e}")
 
 # ── RECORDATORIOS ──────────────────────────────────────────────────────────────
 
@@ -202,6 +252,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• `/mis_tareas` — ver pendientes\n"
         f"• `/listo [número]` — marcar completada\n"
         f"• `/listo_todas` — marcar todas\n\n"
+        f"Recibirás notificación inmediata cuando te asignen una tarea nueva.\n"
         f"Recordatorios: {MORNING_HOUR}:00 AM y {AFTERNOON_HOUR}:00 PM.",
         parse_mode="Markdown")
 
@@ -241,6 +292,10 @@ async def cmd_listo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     task = tasks[idx]
     if await complete_task(task["gid"]):
+        # Actualizar memoria para que no la vuelva a contar como nueva
+        asana_gid = team[tg_id]["asana_gid"]
+        if asana_gid in known_tasks:
+            known_tasks[asana_gid].discard(task["gid"])
         await update.message.reply_text(
             f"🎉 ¡Listo! Marcado en Asana:\n✅ *{task['name']}*", parse_mode="Markdown")
         try:
@@ -267,6 +322,10 @@ async def cmd_listo_todas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for t in tasks:
         if await complete_task(t["gid"]):
             results.append(t["name"])
+    # Limpiar memoria
+    asana_gid = team[tg_id]["asana_gid"]
+    if asana_gid in known_tasks:
+        known_tasks[asana_gid] = set()
     await update.message.reply_text(
         f"🎉 *{len(results)}/{len(tasks)}* tareas completadas en Asana.", parse_mode="Markdown")
     if results:
@@ -319,7 +378,13 @@ def main():
     jq.run_daily(job_afternoon,    time(AFTERNOON_HOUR, AFTERNOON_MIN, tzinfo=TZ))
     jq.run_daily(job_daily_report, time(REPORT_HOUR,    REPORT_MIN,    tzinfo=TZ))
 
-    logger.info(f"✅ Bot Lubrikca listo | {MORNING_HOUR}:00 y {AFTERNOON_HOUR}:00 | Reporte {REPORT_HOUR}:00")
+    # Revisión de tareas nuevas cada X minutos
+    jq.run_repeating(job_check_new_tasks, interval=CHECK_INTERVAL_MINUTES * 60, first=10)
+
+    logger.info(
+        f"✅ Bot Lubrikca listo | Recordatorios: {MORNING_HOUR}:00 y {AFTERNOON_HOUR}:00 | "
+        f"Reporte: {REPORT_HOUR}:00 | Revisión de nuevas tareas: cada {CHECK_INTERVAL_MINUTES} min"
+    )
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
