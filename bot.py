@@ -1,11 +1,6 @@
 """
 Bot de Telegram para seguimiento de tareas de Asana — Lubrikca
-- Envía recordatorios 2 veces al día (mañana y tarde)
-- Detecta tareas nuevas en Asana y notifica al instante
-- Permite confirmar tareas completadas con /listo
-- Marca tareas como completadas en Asana
-- Envía reporte diario al manager
-- El equipo se gestiona en team.txt (sin tocar este archivo)
+Versión 2.0 — Interfaz con botones interactivos
 """
 
 import os
@@ -14,8 +9,11 @@ from datetime import datetime, time
 from pathlib import Path
 import pytz
 import httpx
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    ContextTypes, ConversationHandler, MessageHandler, filters
+)
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -33,23 +31,20 @@ AFTERNOON_HOUR = int(os.environ.get("AFTERNOON_HOUR", "15"))
 AFTERNOON_MIN  = int(os.environ.get("AFTERNOON_MIN",  "0"))
 REPORT_HOUR    = int(os.environ.get("REPORT_HOUR",    "18"))
 REPORT_MIN     = int(os.environ.get("REPORT_MIN",     "0"))
-
-# Cada cuántos minutos revisa si hay tareas nuevas en Asana
 CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "5"))
 
 ASANA_BASE = "https://app.asana.com/api/1.0"
 TZ = pytz.timezone(TIMEZONE)
 
-# Memoria de tareas conocidas por usuario {asana_gid: set(task_gids)}
+# Memoria de tareas conocidas {asana_gid: set(task_gids)}
 known_tasks: dict[str, set] = {}
 
-# ── CARGA DEL EQUIPO DESDE team.txt ───────────────────────────────────────────
+# ── CARGA DEL EQUIPO ───────────────────────────────────────────────────────────
 
 def load_team() -> dict:
     team = {}
     team_file = Path(__file__).parent / "team.txt"
     if not team_file.exists():
-        logger.warning("team.txt no encontrado.")
         return team
     for line in team_file.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -60,12 +55,12 @@ def load_team() -> dict:
             continue
         try:
             tg_id = int(parts[0])
-            asana_gid = parts[1]
-            name = parts[2] if len(parts) > 2 else f"Usuario {tg_id}"
-            team[tg_id] = {"asana_gid": asana_gid, "name": name}
+            team[tg_id] = {
+                "asana_gid": parts[1],
+                "name": parts[2] if len(parts) > 2 else f"Usuario {tg_id}"
+            }
         except ValueError:
-            logger.warning(f"Línea inválida en team.txt: {line}")
-    logger.info(f"Equipo: {[v['name'] for v in team.values()]}")
+            pass
     return team
 
 # ── ASANA API ──────────────────────────────────────────────────────────────────
@@ -108,97 +103,248 @@ def is_overdue(task: dict) -> bool:
         return False
     return datetime.strptime(task["due_on"], "%Y-%m-%d").date() < datetime.now(TZ).date()
 
-def format_task_list(tasks: list) -> str:
-    if not tasks:
-        return "✅ ¡No tienes tareas pendientes!"
-    lines = []
-    for i, t in enumerate(tasks, 1):
-        due = f" — vence *{t['due_on']}*" if t.get("due_on") else ""
-        warn = " ⚠️" if is_overdue(t) else ""
-        lines.append(f"{i}. *{t['name']}*{due}{warn}")
-    return "\n".join(lines)
+def get_first_name(name: str) -> str:
+    return name.split()[0]
 
-# ── DETECCIÓN DE TAREAS NUEVAS ─────────────────────────────────────────────────
+# ── MENÚ PRINCIPAL ─────────────────────────────────────────────────────────────
 
-async def job_check_new_tasks(context: ContextTypes.DEFAULT_TYPE):
-    """Revisa cada X minutos si hay tareas nuevas asignadas y notifica al instante."""
+def main_menu_keyboard(is_manager: bool = False) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton("📋 Ver mis tareas", callback_data="ver_tareas")],
+        [InlineKeyboardButton("✅ Completar una tarea", callback_data="completar_menu")],
+        [InlineKeyboardButton("✅✅ Completar todas", callback_data="completar_todas_confirm")],
+    ]
+    if is_manager:
+        buttons.append([InlineKeyboardButton("📊 Ver reporte del equipo", callback_data="reporte")])
+        buttons.append([InlineKeyboardButton("👥 Ver equipo", callback_data="equipo")])
+    return InlineKeyboardMarkup(buttons)
+
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None):
+    tg_id = update.effective_user.id
     team = load_team()
-    for tg_id, info in team.items():
-        if tg_id == MANAGER_CHAT_ID:
-            continue
-        asana_gid = info["asana_gid"]
-        try:
-            current_tasks = await get_pending_tasks(asana_gid)
-            current_gids = {t["gid"] for t in current_tasks}
+    is_manager = (tg_id == MANAGER_CHAT_ID)
 
-            # Primera vez que vemos a este usuario: guardamos sus tareas actuales sin notificar
-            if asana_gid not in known_tasks:
-                known_tasks[asana_gid] = current_gids
-                logger.info(f"Tareas iniciales cargadas para {info['name']}: {len(current_gids)}")
-                continue
-
-            # Detectar tareas nuevas (que no estaban antes)
-            new_gids = current_gids - known_tasks[asana_gid]
-            new_tasks = [t for t in current_tasks if t["gid"] in new_gids]
-
-            if new_tasks:
-                first_name = info["name"].split()[0]
-                for task in new_tasks:
-                    due = f"\n📅 Vence: *{task['due_on']}*" if task.get("due_on") else ""
-                    msg = (
-                        f"🔔 *¡Nueva tarea asignada, {first_name}!*\n\n"
-                        f"📌 *{task['name']}*{due}\n\n"
-                        f"Cuando la completes, responde:\n`/listo` para ver tu lista"
-                    )
-                    try:
-                        await context.bot.send_message(chat_id=tg_id, text=msg, parse_mode="Markdown")
-                        logger.info(f"Nueva tarea notificada a {info['name']}: {task['name']}")
-                    except Exception as e:
-                        logger.error(f"Error notificando a {tg_id}: {e}")
-
-            # Actualizar memoria
-            known_tasks[asana_gid] = current_gids
-
-        except Exception as e:
-            logger.error(f"Error revisando tareas de {info['name']}: {e}")
-
-# ── RECORDATORIOS ──────────────────────────────────────────────────────────────
-
-async def send_reminder(bot, tg_id: int, name: str, tasks: list, session: str):
-    if not tasks:
+    if tg_id not in team:
+        msg = f"👋 Hola! Aún no estás registrado.\nDile a Marco tu ID: `{tg_id}`"
+        if update.callback_query:
+            await update.callback_query.edit_message_text(msg, parse_mode="Markdown")
+        else:
+            await update.message.reply_text(msg, parse_mode="Markdown")
         return
-    emoji = "🌅" if session == "mañana" else "🌆"
-    overdue = [t for t in tasks if is_overdue(t)]
-    first_name = name.split()[0]
-    msg  = f"{emoji} *Hola {first_name}, recordatorio de {session}*\n\n"
-    msg += f"Tienes *{len(tasks)}* tarea(s) pendiente(s):\n\n"
-    msg += format_task_list(tasks)
-    if overdue:
-        msg += f"\n\n⚠️ *{len(overdue)} tarea(s) vencida(s)*"
-    msg += "\n\n─────────────────\n"
-    msg += "Usa `/listo 1`, `/listo 2`... o `/listo_todas`"
-    try:
-        await bot.send_message(chat_id=tg_id, text=msg, parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"Error enviando a {tg_id}: {e}")
 
-async def job_morning(context: ContextTypes.DEFAULT_TYPE):
+    name = get_first_name(team[tg_id]["name"])
+    greeting = text or f"¡Hola {name}! ¿Qué quieres hacer?"
+    keyboard = main_menu_keyboard(is_manager)
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            greeting, reply_markup=keyboard, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(
+            greeting, reply_markup=keyboard, parse_mode="Markdown")
+
+# ── HANDLERS DE BOTONES ────────────────────────────────────────────────────────
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    tg_id = update.effective_user.id
     team = load_team()
-    for tg_id, info in team.items():
-        if tg_id == MANAGER_CHAT_ID:
-            continue
-        tasks = await get_pending_tasks(info["asana_gid"])
-        await send_reminder(context.bot, tg_id, info["name"], tasks, "mañana")
 
-async def job_afternoon(context: ContextTypes.DEFAULT_TYPE):
-    team = load_team()
-    for tg_id, info in team.items():
-        if tg_id == MANAGER_CHAT_ID:
-            continue
-        tasks = await get_pending_tasks(info["asana_gid"])
-        await send_reminder(context.bot, tg_id, info["name"], tasks, "tarde")
+    # ── VER TAREAS ─────────────────────────────────────────────────────────────
+    if data == "ver_tareas":
+        if tg_id not in team:
+            await query.edit_message_text("❌ No estás registrado.")
+            return
+        tasks = await get_pending_tasks(team[tg_id]["asana_gid"])
+        if not tasks:
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Menú principal", callback_data="menu")
+            ]])
+            await query.edit_message_text(
+                "✅ ¡No tienes tareas pendientes! Estás al día 🎉",
+                reply_markup=keyboard)
+            return
 
-async def job_daily_report(context: ContextTypes.DEFAULT_TYPE):
+        msg = f"📋 *Tus tareas pendientes ({len(tasks)}):*\n\n"
+        for i, t in enumerate(tasks, 1):
+            due = f" — _{t['due_on']}_" if t.get("due_on") else ""
+            warn = " ⚠️" if is_overdue(t) else ""
+            msg += f"{i}. *{t['name']}*{due}{warn}\n"
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Completar una tarea", callback_data="completar_menu")],
+            [InlineKeyboardButton("✅✅ Completar todas", callback_data="completar_todas_confirm")],
+            [InlineKeyboardButton("⬅️ Menú principal", callback_data="menu")],
+        ])
+        await query.edit_message_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+
+    # ── COMPLETAR — MOSTRAR LISTA DE BOTONES ───────────────────────────────────
+    elif data == "completar_menu":
+        if tg_id not in team:
+            await query.edit_message_text("❌ No estás registrado.")
+            return
+        tasks = await get_pending_tasks(team[tg_id]["asana_gid"])
+        if not tasks:
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Menú principal", callback_data="menu")
+            ]])
+            await query.edit_message_text(
+                "✅ ¡No tienes tareas pendientes!", reply_markup=keyboard)
+            return
+
+        msg = "✅ *¿Cuál tarea completaste?*\n\nToca la tarea para marcarla:"
+        buttons = []
+        for t in tasks:
+            warn = "⚠️ " if is_overdue(t) else ""
+            label = f"{warn}{t['name']}"
+            if len(label) > 60:
+                label = label[:57] + "..."
+            buttons.append([InlineKeyboardButton(label, callback_data=f"done_{t['gid']}")])
+        buttons.append([InlineKeyboardButton("⬅️ Volver", callback_data="ver_tareas")])
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+
+    # ── COMPLETAR TAREA INDIVIDUAL ─────────────────────────────────────────────
+    elif data.startswith("done_"):
+        task_gid = data[5:]
+        if tg_id not in team:
+            await query.edit_message_text("❌ No estás registrado.")
+            return
+
+        # Obtener nombre de la tarea antes de completarla
+        tasks = await get_pending_tasks(team[tg_id]["asana_gid"])
+        task_name = next((t["name"] for t in tasks if t["gid"] == task_gid), "Tarea")
+
+        success = await complete_task(task_gid)
+        if success:
+            # Actualizar memoria
+            asana_gid = team[tg_id]["asana_gid"]
+            if asana_gid in known_tasks:
+                known_tasks[asana_gid].discard(task_gid)
+
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Completar otra", callback_data="completar_menu")],
+                [InlineKeyboardButton("⬅️ Menú principal", callback_data="menu")],
+            ])
+            await query.edit_message_text(
+                f"🎉 ¡Perfecto! Marcado en Asana:\n✅ *{task_name}*",
+                reply_markup=keyboard, parse_mode="Markdown")
+
+            # Notificar al manager
+            try:
+                await context.bot.send_message(
+                    chat_id=MANAGER_CHAT_ID,
+                    text=f"✅ *{team[tg_id]['name']}* completó:\n_{task_name}_",
+                    parse_mode="Markdown")
+            except Exception:
+                pass
+        else:
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Menú principal", callback_data="menu")
+            ]])
+            await query.edit_message_text(
+                "❌ Error al actualizar Asana. Intenta de nuevo.",
+                reply_markup=keyboard)
+
+    # ── CONFIRMAR COMPLETAR TODAS ──────────────────────────────────────────────
+    elif data == "completar_todas_confirm":
+        if tg_id not in team:
+            await query.edit_message_text("❌ No estás registrado.")
+            return
+        tasks = await get_pending_tasks(team[tg_id]["asana_gid"])
+        if not tasks:
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Menú principal", callback_data="menu")
+            ]])
+            await query.edit_message_text("✅ ¡Ya no tienes tareas pendientes!", reply_markup=keyboard)
+            return
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"✅ Sí, completar las {len(tasks)} tareas", callback_data="completar_todas")],
+            [InlineKeyboardButton("❌ Cancelar", callback_data="ver_tareas")],
+        ])
+        await query.edit_message_text(
+            f"¿Confirmas que completaste *todas* tus {len(tasks)} tareas pendientes?",
+            reply_markup=keyboard, parse_mode="Markdown")
+
+    # ── COMPLETAR TODAS ────────────────────────────────────────────────────────
+    elif data == "completar_todas":
+        if tg_id not in team:
+            await query.edit_message_text("❌ No estás registrado.")
+            return
+        tasks = await get_pending_tasks(team[tg_id]["asana_gid"])
+        results = []
+        for t in tasks:
+            if await complete_task(t["gid"]):
+                results.append(t["name"])
+
+        asana_gid = team[tg_id]["asana_gid"]
+        if asana_gid in known_tasks:
+            known_tasks[asana_gid] = set()
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Menú principal", callback_data="menu")
+        ]])
+        await query.edit_message_text(
+            f"🎉 ¡Excelente! *{len(results)}/{len(tasks)}* tareas completadas en Asana.",
+            reply_markup=keyboard, parse_mode="Markdown")
+
+        if results:
+            try:
+                names_list = "\n".join(f"✅ _{n}_" for n in results)
+                await context.bot.send_message(
+                    chat_id=MANAGER_CHAT_ID,
+                    text=f"🎉 *{team[tg_id]['name']}* completó todas sus tareas:\n{names_list}",
+                    parse_mode="Markdown")
+            except Exception:
+                pass
+
+    # ── REPORTE (solo manager) ─────────────────────────────────────────────────
+    elif data == "reporte":
+        if tg_id != MANAGER_CHAT_ID:
+            await query.edit_message_text("❌ Solo el manager puede ver el reporte.")
+            return
+        await query.edit_message_text("⏳ Generando reporte...")
+        await _send_report(context.bot)
+        await show_main_menu(update, context, "📊 Reporte enviado.")
+
+    # ── EQUIPO (solo manager) ──────────────────────────────────────────────────
+    elif data == "equipo":
+        if tg_id != MANAGER_CHAT_ID:
+            await query.edit_message_text("❌ Solo el manager puede ver esto.")
+            return
+        team = load_team()
+        members = [(tid, info) for tid, info in team.items() if tid != MANAGER_CHAT_ID]
+        msg = f"👥 *Equipo registrado ({len(members)} personas):*\n\n"
+        for tid, info in members:
+            msg += f"• *{info['name']}*\n"
+        msg += "\n_Para agregar alguien, edita team.txt en GitHub._"
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Menú principal", callback_data="menu")
+        ]])
+        await query.edit_message_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+
+    # ── MENÚ PRINCIPAL ─────────────────────────────────────────────────────────
+    elif data == "menu":
+        await show_main_menu(update, context)
+
+# ── COMANDOS ───────────────────────────────────────────────────────────────────
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_main_menu(update, context)
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_main_menu(update, context)
+
+async def cmd_mi_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"🆔 Tu ID de Telegram es:\n`{update.effective_user.id}`\n\nPásaselo a Marco para registrarte.",
+        parse_mode="Markdown")
+
+# ── REPORTE INTERNO ────────────────────────────────────────────────────────────
+
+async def _send_report(bot):
     team = load_team()
     today = datetime.now(TZ).strftime("%d/%m/%Y")
     all_tasks = {}
@@ -231,161 +377,114 @@ async def job_daily_report(context: ContextTypes.DEFAULT_TYPE):
     msg += f"─────────────────\nTotal pendientes: *{total}*"
     if total_od:
         msg += f" | Vencidas: *{total_od}* ⚠️"
+
+    await bot.send_message(chat_id=MANAGER_CHAT_ID, text=msg, parse_mode="Markdown")
+
+# ── RECORDATORIOS ──────────────────────────────────────────────────────────────
+
+async def send_reminder(bot, tg_id: int, name: str, tasks: list, session: str):
+    if not tasks:
+        return
+    emoji = "🌅" if session == "mañana" else "🌆"
+    overdue = [t for t in tasks if is_overdue(t)]
+    first_name = get_first_name(name)
+
+    msg  = f"{emoji} *Hola {first_name}, recordatorio de {session}*\n\n"
+    msg += f"Tienes *{len(tasks)}* tarea(s) pendiente(s):\n\n"
+    for i, t in enumerate(tasks, 1):
+        due = f" — _{t['due_on']}_" if t.get("due_on") else ""
+        warn = " ⚠️" if is_overdue(t) else ""
+        msg += f"{i}. *{t['name']}*{due}{warn}\n"
+    if overdue:
+        msg += f"\n⚠️ *{len(overdue)} tarea(s) vencida(s)*"
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Completar una tarea", callback_data="completar_menu")],
+        [InlineKeyboardButton("✅✅ Completar todas", callback_data="completar_todas_confirm")],
+        [InlineKeyboardButton("📋 Ver mis tareas", callback_data="ver_tareas")],
+    ])
     try:
-        await context.bot.send_message(chat_id=MANAGER_CHAT_ID, text=msg, parse_mode="Markdown")
+        await bot.send_message(chat_id=tg_id, text=msg, reply_markup=keyboard, parse_mode="Markdown")
     except Exception as e:
-        logger.error(f"Error enviando reporte: {e}")
+        logger.error(f"Error enviando a {tg_id}: {e}")
 
-# ── COMANDOS ───────────────────────────────────────────────────────────────────
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg_id = update.effective_user.id
+async def job_morning(context: ContextTypes.DEFAULT_TYPE):
     team = load_team()
-    if tg_id not in team:
-        await update.message.reply_text(
-            f"👋 Hola! Aún no estás registrado.\nDile a Marco tu ID: `{tg_id}`",
-            parse_mode="Markdown")
-        return
-    name = team[tg_id]["name"].split()[0]
-    await update.message.reply_text(
-        f"✅ ¡Hola {name}! Conectado al sistema de Lubrikca.\n\n"
-        f"• `/mis_tareas` — ver pendientes\n"
-        f"• `/listo [número]` — marcar completada\n"
-        f"• `/listo_todas` — marcar todas\n\n"
-        f"Recibirás notificación inmediata cuando te asignen una tarea nueva.\n"
-        f"Recordatorios: {MORNING_HOUR}:00 AM y {AFTERNOON_HOUR}:00 PM.",
-        parse_mode="Markdown")
+    for tg_id, info in team.items():
+        if tg_id == MANAGER_CHAT_ID:
+            continue
+        tasks = await get_pending_tasks(info["asana_gid"])
+        await send_reminder(context.bot, tg_id, info["name"], tasks, "mañana")
 
-async def cmd_mis_tareas(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg_id = update.effective_user.id
+async def job_afternoon(context: ContextTypes.DEFAULT_TYPE):
     team = load_team()
-    if tg_id not in team:
-        await update.message.reply_text("❌ No estás registrado. Contacta a Marco.")
-        return
-    tasks = await get_pending_tasks(team[tg_id]["asana_gid"])
-    msg = f"📋 *Tus tareas pendientes ({len(tasks)}):*\n\n{format_task_list(tasks)}"
-    if tasks:
-        msg += "\n\nUsa `/listo [número]` para marcarla como completada."
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    for tg_id, info in team.items():
+        if tg_id == MANAGER_CHAT_ID:
+            continue
+        tasks = await get_pending_tasks(info["asana_gid"])
+        await send_reminder(context.bot, tg_id, info["name"], tasks, "tarde")
 
-async def cmd_listo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg_id = update.effective_user.id
+async def job_daily_report(context: ContextTypes.DEFAULT_TYPE):
+    await _send_report(context.bot)
+
+# ── DETECCIÓN DE TAREAS NUEVAS ─────────────────────────────────────────────────
+
+async def job_check_new_tasks(context: ContextTypes.DEFAULT_TYPE):
     team = load_team()
-    if tg_id not in team:
-        await update.message.reply_text("❌ No estás registrado.")
-        return
-    tasks = await get_pending_tasks(team[tg_id]["asana_gid"])
-    if not tasks:
-        await update.message.reply_text("✅ ¡Ya no tienes tareas pendientes!")
-        return
-    if not context.args:
-        await update.message.reply_text(
-            "¿Cuál completaste?\n\n" + format_task_list(tasks) + "\n\nEj: `/listo 1`",
-            parse_mode="Markdown")
-        return
-    try:
-        idx = int(context.args[0]) - 1
-        if not (0 <= idx < len(tasks)):
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text(f"❌ Usa un número entre 1 y {len(tasks)}.")
-        return
-    task = tasks[idx]
-    if await complete_task(task["gid"]):
-        # Actualizar memoria para que no la vuelva a contar como nueva
-        asana_gid = team[tg_id]["asana_gid"]
-        if asana_gid in known_tasks:
-            known_tasks[asana_gid].discard(task["gid"])
-        await update.message.reply_text(
-            f"🎉 ¡Listo! Marcado en Asana:\n✅ *{task['name']}*", parse_mode="Markdown")
+    for tg_id, info in team.items():
+        if tg_id == MANAGER_CHAT_ID:
+            continue
+        asana_gid = info["asana_gid"]
         try:
-            await context.bot.send_message(
-                chat_id=MANAGER_CHAT_ID,
-                text=f"✅ *{team[tg_id]['name']}* completó:\n_{task['name']}_",
-                parse_mode="Markdown")
-        except Exception:
-            pass
-    else:
-        await update.message.reply_text("❌ Error al actualizar Asana. Intenta de nuevo.")
+            current_tasks = await get_pending_tasks(asana_gid)
+            current_gids = {t["gid"] for t in current_tasks}
 
-async def cmd_listo_todas(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg_id = update.effective_user.id
-    team = load_team()
-    if tg_id not in team:
-        await update.message.reply_text("❌ No estás registrado.")
-        return
-    tasks = await get_pending_tasks(team[tg_id]["asana_gid"])
-    if not tasks:
-        await update.message.reply_text("✅ ¡Ya no tienes tareas pendientes!")
-        return
-    results = []
-    for t in tasks:
-        if await complete_task(t["gid"]):
-            results.append(t["name"])
-    # Limpiar memoria
-    asana_gid = team[tg_id]["asana_gid"]
-    if asana_gid in known_tasks:
-        known_tasks[asana_gid] = set()
-    await update.message.reply_text(
-        f"🎉 *{len(results)}/{len(tasks)}* tareas completadas en Asana.", parse_mode="Markdown")
-    if results:
-        try:
-            names_list = "\n".join(f"✅ _{n}_" for n in results)
-            await context.bot.send_message(
-                chat_id=MANAGER_CHAT_ID,
-                text=f"✅ *{team[tg_id]['name']}* completó todo:\n{names_list}",
-                parse_mode="Markdown")
-        except Exception:
-            pass
+            if asana_gid not in known_tasks:
+                known_tasks[asana_gid] = current_gids
+                continue
 
-async def cmd_reporte(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != MANAGER_CHAT_ID:
-        await update.message.reply_text("❌ Solo el manager puede ver el reporte.")
-        return
-    await job_daily_report(context)
+            new_gids = current_gids - known_tasks[asana_gid]
+            new_tasks = [t for t in current_tasks if t["gid"] in new_gids]
 
-async def cmd_mi_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"🆔 Tu ID de Telegram es:\n`{update.effective_user.id}`\n\nPásaselo a Marco para registrarte.",
-        parse_mode="Markdown")
+            for task in new_tasks:
+                due = f"\n📅 Vence: *{task['due_on']}*" if task.get("due_on") else ""
+                first_name = get_first_name(info["name"])
+                msg = (
+                    f"🔔 *¡Nueva tarea asignada, {first_name}!*\n\n"
+                    f"📌 *{task['name']}*{due}"
+                )
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📋 Ver todas mis tareas", callback_data="ver_tareas")],
+                ])
+                try:
+                    await context.bot.send_message(
+                        chat_id=tg_id, text=msg, reply_markup=keyboard, parse_mode="Markdown")
+                except Exception as e:
+                    logger.error(f"Error notificando a {tg_id}: {e}")
 
-async def cmd_equipo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != MANAGER_CHAT_ID:
-        await update.message.reply_text("❌ Solo el manager puede ver esto.")
-        return
-    team = load_team()
-    members = [(tg_id, info) for tg_id, info in team.items() if tg_id != MANAGER_CHAT_ID]
-    msg = f"👥 *Equipo registrado ({len(members)} personas):*\n\n"
-    for tg_id, info in members:
-        msg += f"• *{info['name']}* — `{tg_id}`\n"
-    msg += "\nPara agregar alguien: edita `team.txt` y reinicia en Railway."
-    await update.message.reply_text(msg, parse_mode="Markdown")
+            known_tasks[asana_gid] = current_gids
+        except Exception as e:
+            logger.error(f"Error revisando tareas de {info['name']}: {e}")
 
 # ── MAIN ───────────────────────────────────────────────────────────────────────
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start",       cmd_start))
-    app.add_handler(CommandHandler("mis_tareas",  cmd_mis_tareas))
-    app.add_handler(CommandHandler("listo",       cmd_listo))
-    app.add_handler(CommandHandler("listo_todas", cmd_listo_todas))
-    app.add_handler(CommandHandler("reporte",     cmd_reporte))
-    app.add_handler(CommandHandler("mi_id",       cmd_mi_id))
-    app.add_handler(CommandHandler("equipo",      cmd_equipo))
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu",  cmd_menu))
+    app.add_handler(CommandHandler("mi_id", cmd_mi_id))
+    app.add_handler(CallbackQueryHandler(button_handler))
 
     jq = app.job_queue
     jq.run_daily(job_morning,      time(MORNING_HOUR,   MORNING_MIN,   tzinfo=TZ))
     jq.run_daily(job_afternoon,    time(AFTERNOON_HOUR, AFTERNOON_MIN, tzinfo=TZ))
     jq.run_daily(job_daily_report, time(REPORT_HOUR,    REPORT_MIN,    tzinfo=TZ))
-
-    # Revisión de tareas nuevas cada X minutos
     jq.run_repeating(job_check_new_tasks, interval=CHECK_INTERVAL_MINUTES * 60, first=10)
 
-    logger.info(
-        f"✅ Bot Lubrikca listo | Recordatorios: {MORNING_HOUR}:00 y {AFTERNOON_HOUR}:00 | "
-        f"Reporte: {REPORT_HOUR}:00 | Revisión de nuevas tareas: cada {CHECK_INTERVAL_MINUTES} min"
-    )
+    logger.info(f"✅ Bot Lubrikca v2.0 listo | Recordatorios: {MORNING_HOUR}:00 y {AFTERNOON_HOUR}:00 | Reporte: {REPORT_HOUR}:00")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
+    
