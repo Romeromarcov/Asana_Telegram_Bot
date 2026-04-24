@@ -253,3 +253,4 @@ DAYS_LABEL = {
     "1d":               "mañana",
     "fri_before_monday":"el fin de semana (vence el lunes)",
 }
+
