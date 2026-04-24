@@ -10,6 +10,9 @@ from datetime import datetime, time, date, timedelta
 from pathlib import Path
 import pytz
 import httpx
+import google.generativeai as genai
+genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+model = genai.GenerativeModel('gemini-1.5-flash')
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
