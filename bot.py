@@ -18,6 +18,11 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     ContextTypes, ConversationHandler, MessageHandler, filters
 )
+from minuta import (
+    call_gemini, enrich_tasks, format_tasks_preview, tasks_need_fixing,
+    next_incomplete_idx, save_minuta, load_minutas, build_minuta_record,
+    match_assignee,
+)
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -46,6 +51,7 @@ RECURRING_FILE = Path(__file__).parent / "recurring.json"
 known_tasks: dict[str, set] = {}
 
 # Estados del ConversationHandler para crear tarea
+# + estados del flujo de minutas (8-11)
 (
     TASK_ASSIGNEE,
     TASK_DUE,
@@ -55,7 +61,12 @@ known_tasks: dict[str, set] = {}
     TASK_TIMES_PER_DAY,
     TASK_HOURS,
     TASK_WEEKDAY,
-) = range(8)
+    # Minutas
+    MINUTA_WAITING_CONTENT,
+    MINUTA_CONFIRM,
+    MINUTA_FIX_ASSIGNEE,
+    MINUTA_FIX_DUE,
+) = range(12)
 
 # ── CARGA DEL EQUIPO ───────────────────────────────────────────────────────────
 
@@ -213,6 +224,7 @@ def main_menu_keyboard(is_manager: bool = False) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📋 Ver mis tareas",      callback_data="ver_tareas")],
         [InlineKeyboardButton("✅ Completar una tarea", callback_data="completar_menu")],
         [InlineKeyboardButton("✅✅ Completar todas",   callback_data="completar_todas_confirm")],
+        [InlineKeyboardButton("📝 Subir minuta",        callback_data="minuta_start")],
     ]
     if is_manager:
         buttons.append([InlineKeyboardButton("➕ Crear tarea",           callback_data="crear_tarea_start")])
@@ -1117,8 +1129,498 @@ async def cmd_mi_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown")
 
 # ══════════════════════════════════════════════════════════════════════════════
+# MINUTAS DE REUNIÓN v4.2
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── HELPERS INTERNOS ──────────────────────────────────────────────────────────
+
+async def _minuta_show_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra el resumen de tareas extraídas y los botones de acción."""
+    tasks   = context.user_data.get("minuta_tasks", [])
+    preview = format_tasks_preview(tasks)
+    total   = len(tasks)
+    need_fix = tasks_need_fixing(tasks)
+
+    if need_fix:
+        action_buttons = [
+            [InlineKeyboardButton("✅ Crear todas igual",         callback_data="minuta_create")],
+            [InlineKeyboardButton("✏️ Completar info faltante",  callback_data="minuta_fix")],
+            [InlineKeyboardButton("❌ Cancelar",                  callback_data="minuta_cancel")],
+        ]
+        footer = "\n\n⚠️ _Algunas tareas tienen info incompleta._"
+    else:
+        action_buttons = [
+            [InlineKeyboardButton("✅ Crear todas en Asana", callback_data="minuta_create")],
+            [InlineKeyboardButton("❌ Cancelar",             callback_data="minuta_cancel")],
+        ]
+        footer = "\n\n✅ _Todas las tareas están completas._"
+
+    msg = (
+        f"📋 *Encontré {total} tarea(s) en la minuta:*\n\n"
+        f"{preview}"
+        f"{footer}"
+    )
+    keyboard = InlineKeyboardMarkup(action_buttons)
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            msg, reply_markup=keyboard, parse_mode="Markdown")
+    else:
+        await update.effective_message.reply_text(
+            msg, reply_markup=keyboard, parse_mode="Markdown")
+    return MINUTA_CONFIRM
+
+
+async def _minuta_process_and_show(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    raw_text: str,
+    image_bytes: bytes | None = None,
+    mime_type: str | None = None,
+):
+    """Llama a Gemini, enriquece las tareas y muestra el resumen."""
+    team      = load_team()
+    today_str = datetime.now(TZ).strftime("%Y-%m-%d (%A)")
+    # Solo nombres (sin cargo) para el prompt
+    team_names = [info["name"].split("(")[0].strip() for info in team.values()]
+
+    wait_msg = await update.effective_message.reply_text(
+        "⏳ Analizando la minuta con IA…", parse_mode="Markdown"
+    )
+
+    try:
+        raw_tasks = await call_gemini(raw_text, image_bytes, mime_type, team_names, today_str)
+    except Exception as e:
+        logger.error(f"Error Gemini en minuta: {e}")
+        await wait_msg.edit_text("❌ Error al procesar la minuta con IA. Intenta de nuevo.")
+        return ConversationHandler.END
+
+    await wait_msg.delete()
+
+    if not raw_tasks:
+        await update.effective_message.reply_text(
+            "🤔 No encontré tareas claras en ese texto.\n"
+            "Asegúrate de incluir acciones concretas, responsables y fechas.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Menú", callback_data="menu")
+            ]])
+        )
+        return ConversationHandler.END
+
+    tasks = enrich_tasks(raw_tasks, team)
+    context.user_data["minuta_tasks"]    = tasks
+    context.user_data["minuta_raw_text"] = raw_text or "[imagen/documento]"
+
+    return await _minuta_show_confirm(update, context)
+
+
+async def _show_fix_for_task(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: int):
+    """Muestra los controles de corrección para la tarea incompleta en posición idx."""
+    tasks = context.user_data["minuta_tasks"]
+    task  = tasks[idx]
+    total = len(tasks)
+    name  = task["task_name"]
+
+    # ── Falta responsable ─────────────────────────────────────────────────────
+    if not task.get("assignee_tg_id"):
+        team    = load_team()
+        members = get_members(team)
+        buttons = []
+        row     = []
+        for tid, info in members:
+            first = get_first_name(info["name"])
+            row.append(InlineKeyboardButton(
+                first, callback_data=f"mfix_as_{idx}_{tid}"
+            ))
+            if len(row) == 3:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        buttons.append([
+            InlineKeyboardButton("⏭️ Saltar esta tarea", callback_data=f"mfix_skip_{idx}")
+        ])
+        msg = (
+            f"✏️ *Tarea {idx+1}/{total}:*\n"
+            f"📌 _{name}_\n\n"
+            f"👤 ¿A quién se la asignas?"
+        )
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                msg, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+        else:
+            await update.effective_message.reply_text(
+                msg, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+        return MINUTA_FIX_ASSIGNEE
+
+    # ── Falta fecha ───────────────────────────────────────────────────────────
+    if not task.get("due_on"):
+        today    = datetime.now(TZ).date()
+        tomorrow = today + timedelta(days=1)
+        week_end = today + timedelta(days=(4 - today.weekday()) % 7 or 7)
+        buttons  = [
+            [
+                InlineKeyboardButton(
+                    f"Hoy ({today.strftime('%d/%m')})", callback_data=f"mfix_due_{idx}_{today}"),
+                InlineKeyboardButton(
+                    f"Mañana ({tomorrow.strftime('%d/%m')})", callback_data=f"mfix_due_{idx}_{tomorrow}"),
+            ],
+            [
+                InlineKeyboardButton(
+                    f"Esta semana ({week_end.strftime('%d/%m')})", callback_data=f"mfix_due_{idx}_{week_end}"),
+                InlineKeyboardButton(
+                    "📅 Elegir fecha", callback_data=f"mfix_due_{idx}_custom"),
+            ],
+            [InlineKeyboardButton("⏭️ Saltar esta tarea", callback_data=f"mfix_skip_{idx}")],
+        ]
+        msg = (
+            f"✏️ *Tarea {idx+1}/{total}:*\n"
+            f"📌 _{name}_\n"
+            f"👤 {task.get('assignee_name','—')}\n\n"
+            f"📅 ¿Cuándo vence?"
+        )
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                msg, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+        else:
+            await update.effective_message.reply_text(
+                msg, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+        return MINUTA_FIX_DUE
+
+    # Tarea completa — avanzar a la siguiente
+    return await _advance_fix(update, context, idx + 1)
+
+
+async def _advance_fix(update: Update, context: ContextTypes.DEFAULT_TYPE, next_idx: int):
+    """Busca la próxima tarea incompleta o pasa al resumen final."""
+    tasks = context.user_data["minuta_tasks"]
+    idx   = next_incomplete_idx(tasks, next_idx)
+    if idx is not None:
+        context.user_data["minuta_fix_idx"] = idx
+        return await _show_fix_for_task(update, context, idx)
+    # Todas completas → mostrar confirmación final
+    return await _minuta_show_confirm(update, context)
+
+
+async def _create_all_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Crea todas las tareas en Asana, notifica a los responsables y guarda el historial."""
+    tasks       = context.user_data.get("minuta_tasks", [])
+    raw_text    = context.user_data.get("minuta_raw_text", "")
+    tg_id       = update.effective_user.id
+    team        = load_team()
+    submitter_name = team.get(tg_id, {}).get("name", "Desconocido")
+
+    created_count = 0
+    skipped       = []
+
+    for t in tasks:
+        if not t.get("assignee_gid"):
+            skipped.append(t["task_name"])
+            continue
+        try:
+            result = await create_asana_task(
+                name         = t["task_name"],
+                assignee_gid = t["assignee_gid"],
+                due_on       = t.get("due_on"),
+            )
+            gid = result.get("gid", "")
+            t["created_gid"] = gid
+
+            # Registrar para recordatorios de escalación
+            today_str = datetime.now(TZ).strftime("%Y-%m-%d")
+            if t.get("due_on") and gid:
+                register_unique_task(gid, today_str, t["due_on"])
+
+            created_count += 1
+
+            # Notificar al responsable
+            assignee_tg = t.get("assignee_tg_id")
+            if assignee_tg:
+                first = get_first_name(t["assignee_name"])
+                due_s = due_label(t.get("due_on"))
+                try:
+                    await context.bot.send_message(
+                        chat_id = assignee_tg,
+                        text    = (
+                            f"🔔 *¡Nueva tarea, {first}!*\n\n"
+                            f"📌 *{t['task_name']}*\n"
+                            f"📅 Vence: {due_s}\n"
+                            f"📝 _Asignada desde minuta de reunión_"
+                        ),
+                        reply_markup = InlineKeyboardMarkup([[
+                            InlineKeyboardButton("📋 Ver mis tareas", callback_data="ver_tareas")
+                        ]]),
+                        parse_mode = "Markdown",
+                    )
+                except Exception as e:
+                    logger.error(f"Error notificando a {assignee_tg}: {e}")
+
+        except Exception as e:
+            logger.error(f"Error creando tarea '{t['task_name']}' en Asana: {e}")
+            skipped.append(t["task_name"])
+
+    # Guardar en historial
+    record = build_minuta_record(tg_id, submitter_name, raw_text, tasks, TZ)
+    save_minuta(record)
+
+    # Resumen final
+    msg = f"🎉 *¡Minuta procesada!*\n\n✅ {created_count} tarea(s) creadas en Asana."
+    if skipped:
+        msg += f"\n⏭️ {len(skipped)} omitida(s) (sin responsable):\n"
+        msg += "\n".join(f"• _{t}_" for t in skipped)
+
+    context.user_data.pop("minuta_tasks",    None)
+    context.user_data.pop("minuta_raw_text", None)
+    context.user_data.pop("minuta_fix_idx",  None)
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⬅️ Menú", callback_data="menu")
+    ]])
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            msg, reply_markup=keyboard, parse_mode="Markdown")
+    else:
+        await update.effective_message.reply_text(
+            msg, reply_markup=keyboard, parse_mode="Markdown")
+    return ConversationHandler.END
+
+
+# ── ENTRY POINT ───────────────────────────────────────────────────────────────
+
+async def cmd_minuta(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /minuta — pide al usuario que envíe el contenido de la minuta."""
+    msg = (
+        "📝 *Subir minuta de reunión*\n\n"
+        "Envía la minuta en cualquiera de estos formatos:\n"
+        "• ✍️ Texto directo en este chat\n"
+        "• 🖼️ Foto de la pizarra o pizarrón\n"
+        "• 📄 Archivo PDF\n\n"
+        "_Gemini extraerá las tareas, responsables y fechas automáticamente._"
+    )
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(msg, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    return MINUTA_WAITING_CONTENT
+
+
+# ── RECEPCIÓN DE CONTENIDO ────────────────────────────────────────────────────
+
+async def handle_minuta_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Recibe la minuta como texto plano (o mensaje reenviado)."""
+    text = update.message.text or (
+        update.message.forward_origin and update.message.text
+    )
+    if not text or len(text.strip()) < 20:
+        await update.message.reply_text(
+            "⚠️ El texto es muy corto. Pega el contenido completo de la minuta.")
+        return MINUTA_WAITING_CONTENT
+    return await _minuta_process_and_show(update, context, raw_text=text.strip())
+
+
+async def handle_minuta_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Recibe la minuta como imagen (foto de pizarra, documento escaneado, etc.)."""
+    photo = update.message.photo[-1]          # tamaño más grande
+    tg_file = await context.bot.get_file(photo.file_id)
+    byte_arr = await tg_file.download_as_bytearray()
+    return await _minuta_process_and_show(
+        update, context,
+        raw_text=None,
+        image_bytes=bytes(byte_arr),
+        mime_type="image/jpeg",
+    )
+
+
+async def handle_minuta_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Recibe la minuta como documento (PDF, imagen enviada como archivo)."""
+    doc = update.message.document
+    SUPPORTED = ("application/pdf", "image/jpeg", "image/png", "image/webp")
+    if doc.mime_type not in SUPPORTED:
+        await update.message.reply_text(
+            f"⚠️ Formato no soportado: `{doc.mime_type}`\n"
+            "Por favor envía la minuta como texto, foto o PDF.",
+            parse_mode="Markdown",
+        )
+        return MINUTA_WAITING_CONTENT
+
+    tg_file  = await context.bot.get_file(doc.file_id)
+    byte_arr = await tg_file.download_as_bytearray()
+    return await _minuta_process_and_show(
+        update, context,
+        raw_text=None,
+        image_bytes=bytes(byte_arr),
+        mime_type=doc.mime_type,
+    )
+
+
+# ── CONFIRMACIÓN ──────────────────────────────────────────────────────────────
+
+async def handle_minuta_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Crea todas las tareas en Asana sin corrección previa."""
+    await update.callback_query.answer()
+    return await _create_all_tasks(update, context)
+
+
+async def handle_minuta_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancela el flujo de minuta y regresa al menú."""
+    await update.callback_query.answer()
+    context.user_data.pop("minuta_tasks",    None)
+    context.user_data.pop("minuta_raw_text", None)
+    context.user_data.pop("minuta_fix_idx",  None)
+    await show_main_menu(update, context, "❌ Minuta cancelada.")
+    return ConversationHandler.END
+
+
+async def handle_minuta_fix_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inicia el flujo de corrección de tareas incompletas."""
+    await update.callback_query.answer()
+    tasks = context.user_data.get("minuta_tasks", [])
+    idx   = next_incomplete_idx(tasks, 0)
+    if idx is None:
+        return await _create_all_tasks(update, context)
+    context.user_data["minuta_fix_idx"] = idx
+    return await _show_fix_for_task(update, context, idx)
+
+
+# ── CORRECCIÓN: RESPONSABLE ───────────────────────────────────────────────────
+
+async def handle_minuta_fix_assignee(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Asigna un responsable a la tarea en corrección (mfix_as_{idx}_{tg_id})."""
+    query = update.callback_query
+    await query.answer()
+    parts   = query.data.split("_")   # ['mfix', 'as', idx, tg_id]
+    task_idx = int(parts[2])
+    tg_id    = int(parts[3])
+
+    team = load_team()
+    if tg_id in team:
+        info = team[tg_id]
+        tasks = context.user_data["minuta_tasks"]
+        tasks[task_idx]["assignee_tg_id"] = tg_id
+        tasks[task_idx]["assignee_gid"]   = info["asana_gid"]
+        tasks[task_idx]["assignee_name"]  = info["name"]
+
+    return await _advance_fix(update, context, task_idx)
+
+
+async def handle_minuta_fix_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Salta la tarea incompleta sin asignar responsable ni fecha."""
+    query = update.callback_query
+    await query.answer()
+    parts    = query.data.split("_")   # ['mfix', 'skip', idx]
+    task_idx = int(parts[2])
+    return await _advance_fix(update, context, task_idx + 1)
+
+
+# ── CORRECCIÓN: FECHA ─────────────────────────────────────────────────────────
+
+async def handle_minuta_fix_due(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Asigna fecha a la tarea en corrección.
+    callback_data: mfix_due_{idx}_{date|custom}
+    """
+    query = update.callback_query
+    await query.answer()
+    # data = "mfix_due_0_2026-04-30" ó "mfix_due_0_custom"
+    parts    = query.data.split("_", 3)   # ['mfix', 'due', idx, date_or_custom]
+    task_idx = int(parts[2])
+    value    = parts[3]
+
+    if value == "custom":
+        context.user_data["minuta_fix_idx"]         = task_idx
+        context.user_data["minuta_awaiting_date"]   = True
+        await query.edit_message_text(
+            "📅 Escribe la fecha en formato *DD/MM/AAAA*\nEj: `30/04/2026`",
+            parse_mode="Markdown",
+        )
+        return MINUTA_FIX_DUE
+
+    # Valor directo de fecha
+    tasks = context.user_data["minuta_tasks"]
+    tasks[task_idx]["due_on"] = value
+    context.user_data.pop("minuta_awaiting_date", None)
+    return await _advance_fix(update, context, task_idx)
+
+
+async def handle_minuta_fix_due_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Recibe fecha manual cuando el usuario escribe DD/MM/AAAA."""
+    if not context.user_data.get("minuta_awaiting_date"):
+        return MINUTA_FIX_DUE
+
+    text = update.message.text.strip()
+    try:
+        d = datetime.strptime(text, "%d/%m/%Y").date()
+        task_idx = context.user_data["minuta_fix_idx"]
+        context.user_data["minuta_tasks"][task_idx]["due_on"] = d.strftime("%Y-%m-%d")
+        context.user_data.pop("minuta_awaiting_date", None)
+        return await _advance_fix(update, context, task_idx)
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Formato inválido. Escribe la fecha así: `30/04/2026`",
+            parse_mode="Markdown",
+        )
+        return MINUTA_FIX_DUE
+
+
+# ── HISTORIAL DE MINUTAS ──────────────────────────────────────────────────────
+
+async def cmd_historial_minutas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /minutas — muestra las últimas minutas procesadas.
+    Solo el manager puede ver el historial completo;
+    los demás solo ven las minutas donde participaron.
+    """
+    tg_id = update.effective_user.id
+    data  = load_minutas()
+
+    if not data:
+        await update.message.reply_text(
+            "📂 Aún no hay minutas guardadas.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Menú", callback_data="menu")
+            ]]),
+        )
+        return
+
+    is_manager = (tg_id == MANAGER_CHAT_ID)
+    if is_manager:
+        visible = data[-10:]           # últimas 10
+    else:
+        # Solo minutas donde el usuario tiene tareas asignadas
+        visible = [
+            m for m in data[-20:]
+            if any(t.get("assignee_name") and
+                   load_team().get(tg_id, {}).get("name", "") in (t.get("assignee_name") or "")
+                   for t in m.get("tasks_created", []))
+        ][-5:]
+
+    if not visible:
+        await update.message.reply_text("📂 No tienes minutas recientes.")
+        return
+
+    msg = "📋 *Historial de minutas:*\n\n"
+    for m in reversed(visible):
+        n_tasks = len(m.get("tasks_created", []))
+        who     = m.get("submitted_by_name", "—").split("(")[0].strip()
+        msg += (
+            f"📅 *{m['date']} {m.get('time','')}*  —  {who}\n"
+            f"   {n_tasks} tarea(s) creada(s)\n\n"
+        )
+
+    await update.message.reply_text(
+        msg,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Menú", callback_data="menu")
+        ]]),
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ESCALACIÓN AUTOMÁTICA v4.0
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 from escalation import (
     should_remind_before_due, should_escalate_overdue,
@@ -1371,9 +1873,47 @@ def main():
     )
 
     app.add_handler(conv_handler)
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("menu",   cmd_menu))
-    app.add_handler(CommandHandler("mi_id",  cmd_mi_id))
+
+    # ── ConversationHandler: Minutas ──────────────────────────────────────────
+    minuta_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler("minuta", cmd_minuta),
+            CallbackQueryHandler(cmd_minuta, pattern="^minuta_start$"),
+        ],
+        states={
+            MINUTA_WAITING_CONTENT: [
+                MessageHandler(filters.PHOTO,                      handle_minuta_photo),
+                MessageHandler(filters.Document.ALL,               handle_minuta_document),
+                MessageHandler(filters.TEXT & ~filters.COMMAND,    handle_minuta_text),
+            ],
+            MINUTA_CONFIRM: [
+                CallbackQueryHandler(handle_minuta_create,    pattern="^minuta_create$"),
+                CallbackQueryHandler(handle_minuta_fix_start, pattern="^minuta_fix$"),
+                CallbackQueryHandler(handle_minuta_cancel,    pattern="^minuta_cancel$"),
+            ],
+            MINUTA_FIX_ASSIGNEE: [
+                CallbackQueryHandler(handle_minuta_fix_assignee, pattern="^mfix_as_"),
+                CallbackQueryHandler(handle_minuta_fix_skip,     pattern="^mfix_skip_"),
+            ],
+            MINUTA_FIX_DUE: [
+                CallbackQueryHandler(handle_minuta_fix_due,     pattern="^mfix_due_"),
+                CallbackQueryHandler(handle_minuta_fix_skip,    pattern="^mfix_skip_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_minuta_fix_due_text),
+            ],
+        },
+        fallbacks=[
+            CallbackQueryHandler(handle_minuta_cancel, pattern="^minuta_cancel$"),
+            CallbackQueryHandler(show_main_menu,       pattern="^menu$"),
+            CommandHandler("menu", cmd_menu),
+        ],
+        per_message=False,
+    )
+    app.add_handler(minuta_handler)
+
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("menu",    cmd_menu))
+    app.add_handler(CommandHandler("mi_id",   cmd_mi_id))
+    app.add_handler(CommandHandler("minutas", cmd_historial_minutas))
     app.add_handler(CallbackQueryHandler(button_handler))
 
     jq = app.job_queue
@@ -1394,8 +1934,13 @@ def main():
     jq.run_repeating(job_process_recurring,         interval=60 * 30, first=30)
     jq.run_repeating(job_check_recurring_completed, interval=60 * 60, first=60)
 
-    logger.info(f"✅ Bot Lubrikca v4.0 listo | Recordatorios: {MORNING_HOUR}:00 y {AFTERNOON_HOUR}:00 | Reporte: {REPORT_HOUR}:00 | Escalación activa")
+    logger.info(
+        f"✅ Bot Lubrikca v4.2 listo | "
+        f"Recordatorios: {MORNING_HOUR}:00 y {AFTERNOON_HOUR}:00 | "
+        f"Reporte: {REPORT_HOUR}:00 | Escalación + Minutas activas"
+    )
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
