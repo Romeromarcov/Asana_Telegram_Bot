@@ -1,8 +1,7 @@
 """
 Motor de procesamiento de minutas — Bot Lubrikca v4.2
-
 Flujo:
-  /minuta → usuario envía texto / foto / PDF
+  📝 Subir minuta → usuario envía texto / foto / PDF
   → Gemini extrae tareas estructuradas
   → revisión + corrección manual en Telegram
   → creación en Asana + notificaciones
@@ -14,11 +13,9 @@ import logging
 import re
 from datetime import datetime
 from pathlib import Path
-
 import google.generativeai as genai
 
 logger = logging.getLogger(__name__)
-
 MINUTAS_FILE = Path(__file__).parent / "minutas.json"
 
 # ── PERSISTENCIA ──────────────────────────────────────────────────────────────
@@ -32,14 +29,11 @@ def load_minutas() -> list:
         return []
 
 def save_minuta(minuta: dict):
-    """Agrega una minuta al historial (máx. 50 registros)."""
     data = load_minutas()
     data.append(minuta)
     if len(data) > 50:
         data = data[-50:]
-    MINUTAS_FILE.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    MINUTAS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 # ── PROMPT PARA GEMINI ────────────────────────────────────────────────────────
 
@@ -63,6 +57,42 @@ def build_prompt(text: str, team_names: list[str], today_str: str) -> str:
 
 # ── LLAMADA A GEMINI ──────────────────────────────────────────────────────────
 
+# Mensajes de error claros según el tipo de fallo
+GEMINI_ERROR_MESSAGES = {
+    "image_quality": (
+        "📷 *No pude leer bien la imagen.*\n\n"
+        "Posibles causas:\n"
+        "• La foto está muy oscura o desenfocada\n"
+        "• El texto es muy pequeño o está cortado\n"
+        "• El ángulo hace difícil leer el contenido\n\n"
+        "💡 *¿Qué puedes hacer?*\n"
+        "• Toma la foto con mejor luz y de frente\n"
+        "• O copia el texto de la minuta y envíalo directamente"
+    ),
+    "no_tasks": (
+        "🤔 *Gemini no encontró tareas en el contenido enviado.*\n\n"
+        "Puede que:\n"
+        "• El texto no tiene compromisos o acciones claras\n"
+        "• La minuta está en un formato muy diferente al esperado\n\n"
+        "💡 *Sugerencia:* Envía el texto directamente con verbos de acción como "
+        "'llamar', 'enviar', 'revisar', 'completar'."
+    ),
+    "parse_error": (
+        "⚙️ *Hubo un error procesando la respuesta de Gemini.*\n\n"
+        "Esto puede pasar cuando la imagen o el documento tiene:\n"
+        "• Múltiples idiomas mezclados\n"
+        "• Tablas o formatos muy complejos\n"
+        "• Texto manuscrito difícil de leer\n\n"
+        "💡 *Solución:* Copia el texto de la minuta y envíalo como mensaje de texto."
+    ),
+    "api_error": (
+        "🌐 *No pude conectarme al servicio de IA en este momento.*\n\n"
+        "Esto es temporal. Por favor:\n"
+        "• Espera un minuto e intenta de nuevo\n"
+        "• Si el problema persiste, avísale a Marco"
+    ),
+}
+
 async def call_gemini(
     text: str,
     image_bytes: bytes | None,
@@ -72,7 +102,7 @@ async def call_gemini(
 ) -> list[dict]:
     """
     Llama a Gemini 1.5 Flash y devuelve la lista cruda de tareas extraídas.
-    Lanza excepción si la llamada falla (el caller debe manejarla).
+    Lanza GeminiError con tipo específico para que el caller muestre el mensaje correcto.
     """
     model = genai.GenerativeModel("gemini-1.5-flash")
     prompt = build_prompt(
@@ -81,98 +111,113 @@ async def call_gemini(
         today_str,
     )
 
-    if image_bytes:
-        content = [prompt, {"mime_type": mime_type, "data": image_bytes}]
-    else:
-        content = prompt
+    try:
+        if image_bytes:
+            content = [prompt, {"mime_type": mime_type, "data": image_bytes}]
+        else:
+            content = prompt
 
-    response = await model.generate_content_async(content)
-    raw = response.text.strip()
+        response = await model.generate_content_async(content)
+        raw = response.text.strip()
 
-    # Eliminar posibles code fences de markdown
+    except Exception as e:
+        error_str = str(e).lower()
+        if "image" in error_str or "vision" in error_str or "media" in error_str:
+            raise GeminiError("image_quality", str(e))
+        raise GeminiError("api_error", str(e))
+
+    # Limpiar posibles code fences de markdown
     raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
-    raw = re.sub(r"\s*```\s*$",       "", raw, flags=re.MULTILINE)
+    raw = re.sub(r"\s*```\s*$", "", raw, flags=re.MULTILINE)
     raw = raw.strip()
 
-    tasks = json.loads(raw)
-    return tasks if isinstance(tasks, list) else [tasks]
+    # Verificar que no esté vacío o sea un mensaje de error de Gemini
+    if not raw or raw.startswith("Lo siento") or raw.startswith("No puedo") or raw == "[]":
+        if image_bytes and (not raw or raw == "[]"):
+            raise GeminiError("image_quality", "Gemini returned empty response for image")
+        raise GeminiError("no_tasks", f"Empty or refusal response: {raw[:100]}")
+
+    try:
+        tasks = json.loads(raw)
+    except json.JSONDecodeError as e:
+        # Si falla el parse y había imagen, probablemente es calidad de imagen
+        if image_bytes:
+            raise GeminiError("image_quality", f"JSON parse error: {e}")
+        raise GeminiError("parse_error", f"JSON parse error: {e} | Raw: {raw[:200]}")
+
+    if not isinstance(tasks, list):
+        tasks = [tasks]
+
+    if len(tasks) == 0:
+        raise GeminiError("no_tasks", "Gemini returned empty task list")
+
+    return tasks
+
+
+class GeminiError(Exception):
+    """Error con tipo específico para mostrar mensaje amigable al usuario."""
+    def __init__(self, error_type: str, detail: str = ""):
+        self.error_type = error_type
+        self.detail = detail
+        super().__init__(f"{error_type}: {detail}")
+
+    def user_message(self) -> str:
+        return GEMINI_ERROR_MESSAGES.get(self.error_type, GEMINI_ERROR_MESSAGES["api_error"])
+
 
 # ── MATCH DE RESPONSABLES ─────────────────────────────────────────────────────
 
 def match_assignee(name_hint: str | None, team: dict) -> tuple:
-    """
-    Busca el miembro del equipo más cercano a name_hint.
-    Devuelve (tg_id, info_dict) o (None, None).
-    """
     if not name_hint:
         return None, None
-
     hint = name_hint.lower().strip()
-
     for tg_id, info in team.items():
         full  = info["name"].lower()
         first = full.split()[0]
         if hint == first or hint == full or hint in full or first in hint:
             return tg_id, info
-
     return None, None
 
 def enrich_tasks(raw_tasks: list[dict], team: dict) -> list[dict]:
-    """
-    Normaliza y enriquece cada tarea con tg_id y asana_gid del responsable.
-    Valida también el formato de la fecha.
-    """
     result = []
     for t in raw_tasks:
         task = {
-            "task_name":     (t.get("task_name") or "Sin nombre").strip(),
-            "assignee_name": t.get("assignee_name"),
+            "task_name":      (t.get("task_name") or "Sin nombre").strip(),
+            "assignee_name":  t.get("assignee_name"),
             "assignee_tg_id": None,
             "assignee_gid":   None,
             "due_on":         t.get("due_on"),
             "notes":          t.get("notes"),
         }
-
-        # Validar formato de fecha
         if task["due_on"]:
             try:
                 datetime.strptime(task["due_on"], "%Y-%m-%d")
             except ValueError:
                 task["due_on"] = None
-
-        # Enriquecer con datos del equipo
         tg_id, info = match_assignee(task["assignee_name"], team)
         if tg_id:
             task["assignee_tg_id"] = tg_id
             task["assignee_gid"]   = info["asana_gid"]
-            task["assignee_name"]  = info["name"]   # nombre canónico
-
+            task["assignee_name"]  = info["name"]
         result.append(task)
     return result
 
 # ── FORMATO PARA TELEGRAM ─────────────────────────────────────────────────────
 
 def format_tasks_preview(tasks: list[dict]) -> str:
-    """Genera el mensaje de resumen de tareas para mostrar en Telegram."""
     lines = []
     for i, t in enumerate(tasks, 1):
         complete = bool(t.get("assignee_tg_id") and t.get("due_on"))
-        icon     = "✅" if complete else "⚠️"
-        who      = t.get("assignee_name") or "❌ Sin responsable"
-        due      = t.get("due_on")        or "❌ Sin fecha"
-        name     = t["task_name"]
-        lines.append(f"{icon} {i}. *{name}*\n   👤 {who}  |  📅 {due}")
+        icon = "✅" if complete else "⚠️"
+        who  = t.get("assignee_name") or "❌ Sin responsable"
+        due  = t.get("due_on")        or "❌ Sin fecha"
+        lines.append(f"{icon} {i}. *{t['task_name']}*\n   👤 {who} | 📅 {due}")
     return "\n\n".join(lines)
 
 def tasks_need_fixing(tasks: list[dict]) -> bool:
-    """True si alguna tarea le falta responsable o fecha."""
-    return any(
-        not t.get("assignee_tg_id") or not t.get("due_on")
-        for t in tasks
-    )
+    return any(not t.get("assignee_tg_id") or not t.get("due_on") for t in tasks)
 
 def next_incomplete_idx(tasks: list[dict], start: int = 0) -> int | None:
-    """Devuelve el índice de la próxima tarea incompleta, o None si no hay."""
     for i in range(start, len(tasks)):
         t = tasks[i]
         if not t.get("assignee_tg_id") or not t.get("due_on"):
@@ -188,21 +233,20 @@ def build_minuta_record(
     tasks_created: list[dict],
     tz,
 ) -> dict:
-    """Construye el registro de historial para una minuta procesada."""
     now = datetime.now(tz)
     return {
-        "id":                now.strftime("%Y%m%d-%H%M%S"),
-        "date":              now.strftime("%Y-%m-%d"),
-        "time":              now.strftime("%H:%M"),
-        "submitted_by":      submitter_tg_id,
-        "submitted_by_name": submitter_name,
-        "raw_text":          raw_text[:2000],   # límite para no inflar el JSON
+        "id":                 now.strftime("%Y%m%d-%H%M%S"),
+        "date":               now.strftime("%Y-%m-%d"),
+        "time":               now.strftime("%H:%M"),
+        "submitted_by":       submitter_tg_id,
+        "submitted_by_name":  submitter_name,
+        "raw_text":           raw_text[:2000],
         "tasks_created": [
             {
-                "task_name":    t["task_name"],
+                "task_name":     t["task_name"],
                 "assignee_name": t.get("assignee_name"),
-                "due_on":       t.get("due_on"),
-                "asana_gid":    t.get("created_gid", ""),
+                "due_on":        t.get("due_on"),
+                "asana_gid":     t.get("created_gid", ""),
             }
             for t in tasks_created
         ],
