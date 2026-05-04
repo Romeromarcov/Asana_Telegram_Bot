@@ -21,6 +21,18 @@ from mover_tareas import (
     get_project_sections, move_task_to_section,
     get_task_current_section
 )
+from asana_projects import (
+    ensure_member_project, add_task_to_member_project,
+    move_task_status, add_task_comment, get_member_project,
+    STANDARD_SECTIONS,
+)
+from team_manager import add_member, remove_member
+from minuta import (
+    call_gemini, enrich_tasks, format_tasks_preview,
+    tasks_need_fixing, next_incomplete_idx,
+    GeminiError, build_minuta_record, save_minuta,
+)
+import google.generativeai as genai
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -38,18 +50,43 @@ AFTERNOON_MIN          = int(os.environ.get("AFTERNOON_MIN",  "0"))
 REPORT_HOUR            = int(os.environ.get("REPORT_HOUR",    "18"))
 REPORT_MIN             = int(os.environ.get("REPORT_MIN",     "0"))
 CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "5"))
+GEMINI_API_KEY         = os.environ.get("GEMINI_API_KEY", "")
 
 ASANA_BASE = "https://app.asana.com/api/1.0"
 TZ         = pytz.timezone(TIMEZONE)
 
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
 # Archivos de datos
-RECURRING_FILE = Path(__file__).parent / "recurring.json"
+RECURRING_FILE   = Path(__file__).parent / "recurring.json"
+KNOWN_TASKS_FILE = Path(__file__).parent / "known_tasks.json"
 
-# Memoria de tareas conocidas {asana_gid: set(task_gids)}
-known_tasks: dict[str, set] = {}
+# ── Persistencia de known_tasks (evita re-notificar al reiniciar) ─────────────
+def load_known_tasks() -> dict[str, set]:
+    if not KNOWN_TASKS_FILE.exists():
+        return {}
+    try:
+        data = json.loads(KNOWN_TASKS_FILE.read_text(encoding="utf-8"))
+        return {k: set(v) for k, v in data.items()}
+    except Exception:
+        return {}
 
-# Estados del ConversationHandler para crear tarea
+def save_known_tasks():
+    try:
+        data = {k: list(v) for k, v in known_tasks.items()}
+        KNOWN_TASKS_FILE.write_text(
+            json.dumps(data, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception as e:
+        logger.warning(f"No se pudo guardar known_tasks: {e}")
+
+# Memoria de tareas conocidas {asana_gid: set(task_gids)} — persiste entre reinicios
+known_tasks: dict[str, set] = load_known_tasks()
+
+# Estados de ConversationHandlers
 (
+    # Crear tarea (manager asigna a otro)
     TASK_ASSIGNEE,
     TASK_DUE,
     TASK_DUE_CUSTOM,
@@ -58,7 +95,20 @@ known_tasks: dict[str, set] = {}
     TASK_TIMES_PER_DAY,
     TASK_HOURS,
     TASK_WEEKDAY,
-) = range(8)
+    # Crear tarea propia (cualquier usuario)
+    SELF_TASK_NAME,
+    SELF_TASK_DUE,
+    SELF_TASK_DUE_CUSTOM,
+    # Minuta
+    MINUTA_WAIT,
+    MINUTA_REVIEW,
+    MINUTA_FIX_ASSIGN,
+    MINUTA_FIX_DATE,
+    # Agregar miembro
+    TEAM_ADD_NAME,
+    TEAM_ADD_TGID,
+    TEAM_ADD_ASANA,
+) = range(18)
 
 # ── CARGA DEL EQUIPO ───────────────────────────────────────────────────────────
 
@@ -213,16 +263,20 @@ def freq_label(config: dict) -> str:
 
 def main_menu_keyboard(is_manager: bool = False) -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton("📋 Ver mis tareas",      callback_data="ver_tareas")],
-        [InlineKeyboardButton("✅ Completar una tarea", callback_data="completar_menu")],
-        [InlineKeyboardButton("✅✅ Completar todas",   callback_data="completar_todas_confirm")],
-        [InlineKeyboardButton("🔀 Mover tarea",         callback_data="mover_start")],
+        [InlineKeyboardButton("📋 Ver mis tareas",       callback_data="ver_tareas")],
+        [InlineKeyboardButton("✅ Completar una tarea",  callback_data="completar_menu")],
+        [InlineKeyboardButton("✅✅ Completar todas",    callback_data="completar_todas_confirm")],
+        [InlineKeyboardButton("🔀 Mover tarea",          callback_data="mover_start")],
+        [InlineKeyboardButton("🔄 Actualizar estado",    callback_data="status_menu")],
+        [InlineKeyboardButton("📝 Crear mi tarea",       callback_data="self_task_start")],
     ]
     if is_manager:
-        buttons.append([InlineKeyboardButton("➕ Crear tarea",           callback_data="crear_tarea_start")])
-        buttons.append([InlineKeyboardButton("🔁 Tareas recurrentes",    callback_data="recurrentes_menu")])
-        buttons.append([InlineKeyboardButton("📊 Reporte del equipo",    callback_data="reporte")])
-        buttons.append([InlineKeyboardButton("👥 Ver equipo",            callback_data="equipo")])
+        buttons.append([InlineKeyboardButton("➕ Crear tarea para alguien", callback_data="crear_tarea_start")])
+        buttons.append([InlineKeyboardButton("📄 Cargar minuta",            callback_data="minuta_start")])
+        buttons.append([InlineKeyboardButton("🔁 Tareas recurrentes",       callback_data="recurrentes_menu")])
+        buttons.append([InlineKeyboardButton("📊 Reporte del equipo",       callback_data="reporte")])
+        buttons.append([InlineKeyboardButton("👥 Equipo",                   callback_data="equipo")])
+        buttons.append([InlineKeyboardButton("➕ Agregar miembro",          callback_data="team_add_start")])
     return InlineKeyboardMarkup(buttons)
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None):
@@ -571,6 +625,19 @@ async def handle_task_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.error(f"Error creando tarea en Asana: {e}")
         await query.edit_message_text("❌ Error al crear la tarea en Asana. Intenta de nuevo.")
         return ConversationHandler.END
+
+    # ── FIX doble notificación: marcar tarea como ya conocida ─────────────────
+    asana_gid_assignee = task["assignee_gid"]
+    if asana_gid_assignee not in known_tasks:
+        known_tasks[asana_gid_assignee] = set()
+    known_tasks[asana_gid_assignee].add(task_gid)
+    save_known_tasks()
+
+    # ── Agregar tarea al proyecto Kanban del colaborador ──────────────────────
+    try:
+        await add_task_to_member_project(task_gid, asana_gid_assignee, ASANA_TOKEN)
+    except Exception as e:
+        logger.warning(f"No se pudo agregar tarea al proyecto del colaborador: {e}")
 
     # Registrar metadata de tarea única para calcular recordatorios dinámicos
     today_str = datetime.now(TZ).strftime("%Y-%m-%d")
@@ -1011,6 +1078,57 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "mover_conf_yes":
         await mover_ejecutar(update, context)
 
+    # ── Tarea propia ──────────────────────────────────────────────────────────
+    elif data == "self_task_start":
+        await self_task_start(update, context)
+
+    # ── Minuta ────────────────────────────────────────────────────────────────
+    elif data == "minuta_start":
+        if tg_id != MANAGER_CHAT_ID:
+            await query.edit_message_text("❌ Solo el manager puede cargar minutas.")
+            return
+        await minuta_start(update, context)
+
+    elif data.startswith("minuta_fix_"):
+        await minuta_fix_dispatch(update, context)
+
+    elif data == "minuta_confirm_all":
+        await minuta_confirm_all(update, context)
+
+    # ── Agregar miembro ───────────────────────────────────────────────────────
+    elif data == "team_add_start":
+        if tg_id != MANAGER_CHAT_ID:
+            await query.edit_message_text("❌ Solo el manager puede agregar miembros.")
+            return
+        await team_add_start(update, context)
+
+    # ── Estado de tarea ───────────────────────────────────────────────────────
+    elif data == "status_menu":
+        await status_menu(update, context)
+
+    elif data.startswith("status_task_"):
+        await status_task_detail(update, context)
+
+    elif data.startswith("set_status_"):
+        await set_task_status(update, context)
+
+    elif data.startswith("task_comment_"):
+        await request_comment(update, context)
+
+    # ── NL task (confirmación desde Gemini) ───────────────────────────────────
+    elif data == "nl_task_confirm":
+        await nl_task_confirm(update, context)
+
+    elif data.startswith("nl_assign_"):
+        await nl_assign_handler(update, context)
+
+    elif data.startswith("nl_due_"):
+        await nl_due_handler(update, context)
+
+    elif data == "nl_task_cancel":
+        context.user_data.pop("nl_task_draft", None)
+        await show_main_menu(update, context, "❌ Tarea cancelada.")
+
 # ── REPORTE ────────────────────────────────────────────────────────────────────
 
 async def _send_report(bot):
@@ -1054,23 +1172,41 @@ async def _send_report(bot):
 async def send_reminder(bot, tg_id: int, name: str, tasks: list, session: str):
     if not tasks:
         return
-    emoji    = "🌅" if session == "mañana" else "🌆"
-    overdue  = [t for t in tasks if is_overdue(t)]
-    msg      = f"{emoji} *Hola {get_first_name(name)}, recordatorio de {session}*\n\n"
-    msg     += f"Tienes *{len(tasks)}* tarea(s) pendiente(s):\n\n"
+    emoji   = "🌅" if session == "mañana" else "🌆"
+    overdue = [t for t in tasks if is_overdue(t)]
+    msg     = f"{emoji} *Hola {get_first_name(name)}, recordatorio de {session}*\n\n"
+    msg    += f"Tienes *{len(tasks)}* tarea(s) pendiente(s):\n\n"
     for i, t in enumerate(tasks, 1):
         due  = f" — _{t['due_on']}_" if t.get("due_on") else ""
         warn = " ⚠️" if is_overdue(t) else ""
         msg += f"{i}. *{t['name']}*{due}{warn}\n"
     if overdue:
         msg += f"\n⚠️ *{len(overdue)} tarea(s) vencida(s)*"
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Completar una tarea",  callback_data="completar_menu")],
-        [InlineKeyboardButton("✅✅ Completar todas",    callback_data="completar_todas_confirm")],
-        [InlineKeyboardButton("📋 Ver mis tareas",       callback_data="ver_tareas")],
-    ])
+
+    # Si hay una sola tarea, mostrar botones de estado directamente
+    if len(tasks) == 1:
+        gid = tasks[0]["gid"]
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("⚙️ En ejecución", callback_data=f"set_status_{gid}_ej"),
+                InlineKeyboardButton("🔍 En revisión",  callback_data=f"set_status_{gid}_rev"),
+            ],
+            [
+                InlineKeyboardButton("✅ Completar",    callback_data=f"done_{gid}"),
+                InlineKeyboardButton("💬 Comentar",     callback_data=f"task_comment_{gid}"),
+            ],
+            [InlineKeyboardButton("📋 Ver mis tareas", callback_data="ver_tareas")],
+        ])
+    else:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Actualizar estado",   callback_data="status_menu")],
+            [InlineKeyboardButton("✅ Completar una tarea", callback_data="completar_menu")],
+            [InlineKeyboardButton("📋 Ver mis tareas",      callback_data="ver_tareas")],
+        ])
     try:
-        await bot.send_message(chat_id=tg_id, text=msg, reply_markup=keyboard, parse_mode="Markdown")
+        await bot.send_message(
+            chat_id=tg_id, text=msg, reply_markup=keyboard, parse_mode="Markdown"
+        )
     except Exception as e:
         logger.error(f"Error enviando a {tg_id}: {e}")
 
@@ -1119,6 +1255,8 @@ async def job_check_new_tasks(context: ContextTypes.DEFAULT_TYPE):
                     reply_markup= keyboard,
                     parse_mode  = "Markdown")
             known_tasks[asana_gid] = current_gids
+            if new_tasks:
+                save_known_tasks()
         except Exception as e:
             logger.error(f"Error revisando {info['name']}: {e}")
 
@@ -1134,6 +1272,1000 @@ async def cmd_mi_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🆔 Tu ID de Telegram es:\n`{update.effective_user.id}`\n\nPásaselo a Marco para registrarte.",
         parse_mode="Markdown")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CREAR TAREA PROPIA (cualquier usuario se auto-asigna)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def self_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.answer()
+    tg_id = update.effective_user.id
+    team  = load_team()
+    if tg_id not in team:
+        msg = "❌ No estás registrado. Contacta a Marco."
+        if query:
+            await query.edit_message_text(msg)
+        else:
+            await update.message.reply_text(msg)
+        return ConversationHandler.END
+
+    msg = "📝 *Crear mi tarea*\n\nEscribe el nombre de la tarea:"
+    if query:
+        await query.edit_message_text(msg, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    return SELF_TASK_NAME
+
+async def self_task_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    task_name = update.message.text.strip()
+    context.user_data["self_task"] = {"name": task_name}
+    tg_id = update.effective_user.id
+    team  = load_team()
+
+    today    = datetime.now(TZ).date()
+    tomorrow = today + timedelta(days=1)
+    week_end = today + timedelta(days=(4 - today.weekday()) % 7 or 7)
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(f"Hoy ({today.strftime('%d/%m')})",       callback_data=f"sdue_{today}"),
+            InlineKeyboardButton(f"Mañana ({tomorrow.strftime('%d/%m')})", callback_data=f"sdue_{tomorrow}"),
+        ],
+        [
+            InlineKeyboardButton(f"Esta semana ({week_end.strftime('%d/%m')})", callback_data=f"sdue_{week_end}"),
+            InlineKeyboardButton("📅 Elegir fecha",                               callback_data="sdue_custom"),
+        ],
+        [InlineKeyboardButton("Sin fecha límite", callback_data="sdue_none")],
+        [InlineKeyboardButton("❌ Cancelar", callback_data="menu")],
+    ])
+    await update.message.reply_text(
+        f"📝 *{task_name}*\n\n📅 ¿Cuándo vence?",
+        reply_markup=keyboard, parse_mode="Markdown"
+    )
+    return SELF_TASK_DUE
+
+async def self_task_due(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "sdue_custom":
+        await query.edit_message_text(
+            "📅 Escribe la fecha: *DD/MM/AAAA*", parse_mode="Markdown"
+        )
+        return SELF_TASK_DUE_CUSTOM
+
+    due_on = None if data == "sdue_none" else data[5:]
+    context.user_data["self_task"]["due_on"] = due_on
+    return await self_task_create(update, context)
+
+async def self_task_due_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    try:
+        d = datetime.strptime(text, "%d/%m/%Y").date()
+        context.user_data["self_task"]["due_on"] = d.strftime("%Y-%m-%d")
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Formato inválido. Escribe: `25/04/2026`", parse_mode="Markdown"
+        )
+        return SELF_TASK_DUE_CUSTOM
+    return await self_task_create(update, context)
+
+async def self_task_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_id = update.effective_user.id
+    team  = load_team()
+    task  = context.user_data["self_task"]
+    info  = team[tg_id]
+    due_on = task.get("due_on")
+
+    try:
+        created  = await create_asana_task(task["name"], info["asana_gid"], due_on)
+        task_gid = created.get("gid", "")
+    except Exception as e:
+        logger.error(f"Error creando tarea propia: {e}")
+        msg = "❌ Error al crear la tarea. Intenta de nuevo."
+        if update.callback_query:
+            await update.callback_query.edit_message_text(msg)
+        else:
+            await update.message.reply_text(msg)
+        return ConversationHandler.END
+
+    # Fix double-notification + agregar al proyecto
+    asana_gid = info["asana_gid"]
+    if asana_gid not in known_tasks:
+        known_tasks[asana_gid] = set()
+    known_tasks[asana_gid].add(task_gid)
+    save_known_tasks()
+    try:
+        await add_task_to_member_project(task_gid, asana_gid, ASANA_TOKEN)
+    except Exception:
+        pass
+
+    today_str = datetime.now(TZ).strftime("%Y-%m-%d")
+    if due_on and task_gid:
+        register_unique_task(task_gid, today_str, due_on)
+
+    due_str = due_label(due_on)
+    msg = (
+        f"✅ *Tarea creada:*\n\n"
+        f"📌 *{task['name']}*\n"
+        f"📅 Vence: {due_str}"
+    )
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Menú", callback_data="menu")]])
+    if update.callback_query:
+        await update.callback_query.edit_message_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+
+    context.user_data.pop("self_task", None)
+    return ConversationHandler.END
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ACTUALIZAR ESTADO DE TAREA (tablero Asana)
+# ══════════════════════════════════════════════════════════════════════════════
+
+STATUS_MAP = {
+    "ej":   "⚙️ En ejecución",
+    "rev":  "🔍 En revisión",
+    "comp": "✅ Completado",
+    "bloq": "🚫 Bloqueado",
+}
+
+async def status_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra la lista de tareas para elegir a cuál cambiar el estado."""
+    query = update.callback_query
+    await query.answer()
+    tg_id = update.effective_user.id
+    team  = load_team()
+
+    if tg_id not in team:
+        await query.edit_message_text("❌ No estás registrado.")
+        return
+
+    tasks = await get_pending_tasks(team[tg_id]["asana_gid"])
+    if not tasks:
+        await query.edit_message_text(
+            "✅ No tienes tareas pendientes.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Menú", callback_data="menu")]]),
+        )
+        return
+
+    buttons = []
+    for t in tasks:
+        warn  = "⚠️ " if is_overdue(t) else ""
+        label = f"{warn}{t['name']}"[:58]
+        buttons.append([InlineKeyboardButton(label, callback_data=f"status_task_{t['gid']}")])
+    buttons.append([InlineKeyboardButton("⬅️ Menú", callback_data="menu")])
+
+    await query.edit_message_text(
+        "🔄 *¿De cuál tarea quieres actualizar el estado?*",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="Markdown",
+    )
+
+async def status_task_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra las opciones de estado para una tarea específica."""
+    query    = update.callback_query
+    await query.answer()
+    task_gid = query.data[len("status_task_"):]
+    tg_id    = update.effective_user.id
+    team     = load_team()
+
+    tasks     = await get_pending_tasks(team[tg_id]["asana_gid"])
+    task_name = next((t["name"] for t in tasks if t["gid"] == task_gid), "Tarea")
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⚙️ En ejecución", callback_data=f"set_status_{task_gid}_ej"),
+            InlineKeyboardButton("🔍 En revisión",  callback_data=f"set_status_{task_gid}_rev"),
+        ],
+        [
+            InlineKeyboardButton("✅ Completar",    callback_data=f"done_{task_gid}"),
+            InlineKeyboardButton("🚫 Bloqueado",    callback_data=f"set_status_{task_gid}_bloq"),
+        ],
+        [InlineKeyboardButton("💬 Comentar",        callback_data=f"task_comment_{task_gid}")],
+        [InlineKeyboardButton("⬅️ Volver",          callback_data="status_menu")],
+    ])
+    await query.edit_message_text(
+        f"🔄 *{task_name}*\n\n¿Cuál es el nuevo estado?",
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+    )
+
+async def set_task_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Aplica el cambio de estado moviendo la tarea en Asana."""
+    query  = update.callback_query
+    await query.answer()
+    parts  = query.data[len("set_status_"):].rsplit("_", 1)
+    if len(parts) != 2:
+        return
+    task_gid, status_code = parts
+    section_name = STATUS_MAP.get(status_code)
+    if not section_name:
+        return
+
+    tg_id = update.effective_user.id
+    team  = load_team()
+
+    if tg_id not in team:
+        await query.edit_message_text("❌ No estás registrado.")
+        return
+
+    tasks     = await get_pending_tasks(team[tg_id]["asana_gid"])
+    task_name = next((t["name"] for t in tasks if t["gid"] == task_gid), "Tarea")
+    asana_gid = team[tg_id]["asana_gid"]
+
+    success = await move_task_status(task_gid, asana_gid, section_name, ASANA_TOKEN)
+
+    if success:
+        await query.edit_message_text(
+            f"✅ *Estado actualizado*\n\n📌 *{task_name}*\n🔄 → {section_name}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Actualizar otra", callback_data="status_menu")],
+                [InlineKeyboardButton("⬅️ Menú",            callback_data="menu")],
+            ]),
+            parse_mode="Markdown",
+        )
+        # Notificar al manager
+        if tg_id != MANAGER_CHAT_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=MANAGER_CHAT_ID,
+                    text=(
+                        f"🔄 *{team[tg_id]['name']}* actualizó estado:\n"
+                        f"📌 _{task_name}_\n→ {section_name}"
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+    else:
+        await query.edit_message_text(
+            f"⚠️ El proyecto de tablero aún no está configurado.\n"
+            f"El manager puede activarlo reiniciando el bot.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Menú", callback_data="menu")]]),
+        )
+
+async def request_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Pide al usuario que escriba un comentario para la tarea."""
+    query    = update.callback_query
+    await query.answer()
+    task_gid = query.data[len("task_comment_"):]
+    tg_id    = update.effective_user.id
+    team     = load_team()
+
+    tasks     = await get_pending_tasks(team[tg_id]["asana_gid"])
+    task_name = next((t["name"] for t in tasks if t["gid"] == task_gid), "Tarea")
+
+    context.user_data["awaiting_comment_for"]   = task_gid
+    context.user_data["awaiting_comment_name"]  = task_name
+
+    await query.edit_message_text(
+        f"💬 *Comentar tarea:*\n📌 _{task_name}_\n\nEscribe tu comentario:",
+        parse_mode="Markdown",
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEXTO LIBRE → TAREA (lenguaje natural via Gemini) + COMENTARIOS
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Maneja mensajes de texto libres (fuera de ConversationHandlers):
+      1. Si hay comentario pendiente → lo agrega a Asana.
+      2. Si es el manager → intenta detectar una tarea con Gemini.
+      3. Otros → mensaje de ayuda.
+    """
+    text  = update.message.text.strip()
+    tg_id = update.effective_user.id
+    team  = load_team()
+
+    # ── 1. Comentario pendiente ────────────────────────────────────────────────
+    task_gid   = context.user_data.pop("awaiting_comment_for", None)
+    task_name  = context.user_data.pop("awaiting_comment_name", "")
+    if task_gid:
+        first_name = get_first_name(team[tg_id]["name"]) if tg_id in team else "Alguien"
+        full_comment = f"[{first_name} via Bot] {text}"
+        try:
+            await add_task_comment(task_gid, full_comment, ASANA_TOKEN)
+            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Menú", callback_data="menu")]])
+            await update.message.reply_text(
+                f"💬 Comentario agregado a:\n📌 *{task_name}*",
+                reply_markup=keyboard, parse_mode="Markdown",
+            )
+            if tg_id != MANAGER_CHAT_ID:
+                try:
+                    await context.bot.send_message(
+                        chat_id=MANAGER_CHAT_ID,
+                        text=(
+                            f"💬 *{team[tg_id]['name']}* comentó en:\n"
+                            f"📌 _{task_name}_\n\n_{text}_"
+                        ),
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error(f"Error agregando comentario: {e}")
+            await update.message.reply_text("❌ No pude agregar el comentario. Intenta de nuevo.")
+        return
+
+    # ── 2. NL awaiting custom date ────────────────────────────────────────────
+    if context.user_data.get("nl_awaiting_date"):
+        context.user_data.pop("nl_awaiting_date", None)
+        try:
+            d = datetime.strptime(text, "%d/%m/%Y").date()
+            draft = context.user_data.get("nl_task_draft", {})
+            draft["due_on"] = d.strftime("%Y-%m-%d")
+            context.user_data["nl_task_draft"] = draft
+            await _show_nl_draft(update, context)
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Formato inválido. Escribe: `25/04/2026`\nO escribe /menu para cancelar.",
+                parse_mode="Markdown",
+            )
+        return
+
+    # ── 3. Detección de tarea con Gemini (manager y equipo) ──────────────────
+    if tg_id not in team and tg_id != MANAGER_CHAT_ID:
+        await update.message.reply_text(
+            "❓ No entendí ese mensaje. Usa el /menu para ver las opciones."
+        )
+        return
+
+    if not GEMINI_API_KEY:
+        await update.message.reply_text(
+            "⚙️ Para crear tareas por texto configura GEMINI_API_KEY.\n"
+            "Usa el menú para crear tareas."
+        )
+        return
+
+    # Mostrar indicador de carga
+    loading = await update.message.reply_text("🤖 Analizando...")
+
+    today_str  = datetime.now(TZ).strftime("%Y-%m-%d")
+    team_names = [info["name"].split("(")[0].strip() for _, info in get_members(team)]
+
+    try:
+        raw_tasks = await call_gemini(text, None, None, team_names, today_str)
+        tasks     = enrich_tasks(raw_tasks, team)
+    except GeminiError as e:
+        await loading.delete()
+        await update.message.reply_text(
+            e.user_message(), parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Menú", callback_data="menu")]]),
+        )
+        return
+    except Exception as e:
+        logger.error(f"Error NL task Gemini: {e}")
+        await loading.delete()
+        await update.message.reply_text("❌ Error al procesar el mensaje. Intenta de nuevo.")
+        return
+
+    await loading.delete()
+
+    if not tasks:
+        await update.message.reply_text(
+            "🤔 No detecté ninguna tarea en ese mensaje.\n"
+            "Usa *➕ Crear tarea* en el menú, o escribe algo como:\n"
+            "_\"Alexandra: revisar cotización MDF el viernes\"_",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Menú", callback_data="menu")]]),
+        )
+        return
+
+    # Guardar el primer task como draft (procesamos uno a la vez)
+    context.user_data["nl_task_draft"] = tasks[0]
+    if len(tasks) > 1:
+        context.user_data["nl_task_draft"]["_extra_count"] = len(tasks) - 1
+    await _show_nl_draft(update, context)
+
+async def _show_nl_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra el borrador de tarea detectada por Gemini."""
+    draft     = context.user_data.get("nl_task_draft", {})
+    task_name = draft.get("task_name", "Sin nombre")
+    assignee  = draft.get("assignee_name")
+    due_on    = draft.get("due_on")
+    extra     = draft.get("_extra_count", 0)
+
+    who  = assignee or "❓ Sin responsable"
+    when = due_label(due_on) if due_on else "❓ Sin fecha"
+
+    msg = f"🤖 *Tarea detectada:*\n\n📌 *{task_name}*\n👤 {who}  |  📅 {when}"
+    if extra:
+        msg += f"\n\n_+ {extra} tarea(s) más detectada(s) — créalas desde el menú._"
+
+    buttons = []
+
+    # Si falta el responsable → mostrar selector
+    if not draft.get("assignee_tg_id"):
+        msg += "\n\n👤 *¿A quién se la asigno?*"
+        team    = load_team()
+        members = get_members(team)
+        row     = []
+        for tid, info in members:
+            first = get_first_name(info["name"])
+            row.append(InlineKeyboardButton(first, callback_data=f"nl_assign_{tid}"))
+            if len(row) == 3:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+
+    # Si falta la fecha → mostrar selector
+    elif not due_on:
+        msg += "\n\n📅 *¿Cuándo vence?*"
+        today    = datetime.now(TZ).date()
+        tomorrow = today + timedelta(days=1)
+        week_end = today + timedelta(days=(4 - today.weekday()) % 7 or 7)
+        buttons = [
+            [
+                InlineKeyboardButton(f"Hoy ({today.strftime('%d/%m')})",        callback_data=f"nl_due_{today}"),
+                InlineKeyboardButton(f"Mañana ({tomorrow.strftime('%d/%m')})",  callback_data=f"nl_due_{tomorrow}"),
+            ],
+            [
+                InlineKeyboardButton(f"Esta semana ({week_end.strftime('%d/%m')})", callback_data=f"nl_due_{week_end}"),
+                InlineKeyboardButton("📅 Otra fecha",                                callback_data="nl_due_custom"),
+            ],
+            [InlineKeyboardButton("Sin fecha", callback_data="nl_due_none")],
+        ]
+
+    # Todo completo → confirmar
+    else:
+        buttons = [
+            [
+                InlineKeyboardButton("✅ Crear tarea", callback_data="nl_task_confirm"),
+                InlineKeyboardButton("❌ Cancelar",    callback_data="nl_task_cancel"),
+            ]
+        ]
+
+    keyboard = InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("❌ Cancelar", callback_data="nl_task_cancel")]])
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+
+async def nl_assign_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    tid   = int(query.data[len("nl_assign_"):])
+    team  = load_team()
+
+    if tid not in team:
+        return
+
+    draft = context.user_data.get("nl_task_draft", {})
+    info  = team[tid]
+    draft["assignee_tg_id"] = tid
+    draft["assignee_gid"]   = info["asana_gid"]
+    draft["assignee_name"]  = info["name"]
+    context.user_data["nl_task_draft"] = draft
+    await _show_nl_draft(update, context)
+
+async def nl_due_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data  = query.data[len("nl_due_"):]
+    draft = context.user_data.get("nl_task_draft", {})
+
+    if data == "custom":
+        context.user_data["nl_awaiting_date"] = True
+        await query.edit_message_text(
+            "📅 Escribe la fecha en formato *DD/MM/AAAA*:", parse_mode="Markdown"
+        )
+        return
+
+    draft["due_on"] = None if data == "none" else data
+    context.user_data["nl_task_draft"] = draft
+    await _show_nl_draft(update, context)
+
+async def nl_task_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    draft = context.user_data.pop("nl_task_draft", {})
+
+    if not draft or not draft.get("assignee_gid"):
+        await query.edit_message_text("❌ Faltan datos. Usa ➕ Crear tarea desde el menú.")
+        return
+
+    try:
+        created  = await create_asana_task(
+            draft["task_name"], draft["assignee_gid"], draft.get("due_on")
+        )
+        task_gid = created.get("gid", "")
+    except Exception as e:
+        logger.error(f"Error creando NL task: {e}")
+        await query.edit_message_text("❌ Error al crear la tarea. Intenta de nuevo.")
+        return
+
+    # Fix double-notification + agregar al proyecto
+    agid = draft["assignee_gid"]
+    if agid not in known_tasks:
+        known_tasks[agid] = set()
+    known_tasks[agid].add(task_gid)
+    save_known_tasks()
+    try:
+        await add_task_to_member_project(task_gid, agid, ASANA_TOKEN)
+    except Exception:
+        pass
+
+    today_str = datetime.now(TZ).strftime("%Y-%m-%d")
+    if draft.get("due_on") and task_gid:
+        register_unique_task(task_gid, today_str, draft["due_on"])
+
+    first_name = get_first_name(draft["assignee_name"])
+    due_str    = due_label(draft.get("due_on"))
+
+    # Notificar al responsable
+    try:
+        await context.bot.send_message(
+            chat_id=draft["assignee_tg_id"],
+            text=(
+                f"🔔 *¡Nueva tarea, {first_name}!*\n\n"
+                f"📌 *{draft['task_name']}*\n"
+                f"📅 Vence: {due_str}"
+            ),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📋 Ver mis tareas", callback_data="ver_tareas")
+            ]]),
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
+
+    await query.edit_message_text(
+        f"🎉 *¡Tarea creada!*\n\n📌 *{draft['task_name']}*\n👤 {draft['assignee_name']}  |  📅 {due_str}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Menú", callback_data="menu")]]),
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MINUTA DE REUNIÓN (Gemini extrae tareas masivas)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def minuta_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.answer()
+
+    msg = (
+        "📄 *Cargar minuta de reunión*\n\n"
+        "Envía el contenido de la minuta en cualquier formato:\n"
+        "• ✍️ Texto pegado directamente\n"
+        "• 📷 Foto de la pizarra o documento\n"
+        "• 📎 Archivo PDF\n\n"
+        "_Gemini extraerá todas las tareas y las asignará automáticamente._"
+    )
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="menu")]])
+    if query:
+        await query.edit_message_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+    return MINUTA_WAIT
+
+async def minuta_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Recibe texto, foto o PDF y llama a Gemini."""
+    tg_id = update.effective_user.id
+    team  = load_team()
+
+    text        = None
+    image_bytes = None
+    mime_type   = None
+    raw_text    = ""
+
+    if update.message.text:
+        text     = update.message.text.strip()
+        raw_text = text
+
+    elif update.message.photo:
+        loading = await update.message.reply_text("📷 Procesando imagen...")
+        photo   = update.message.photo[-1]  # mejor resolución
+        f       = await photo.get_file()
+        image_bytes = bytes(await f.download_as_bytearray())
+        mime_type   = "image/jpeg"
+        raw_text    = "[imagen]"
+        await loading.delete()
+
+    elif update.message.document:
+        doc = update.message.document
+        if doc.mime_type != "application/pdf":
+            await update.message.reply_text(
+                "❌ Solo acepto archivos PDF. Envía el texto o una foto."
+            )
+            return MINUTA_WAIT
+        loading = await update.message.reply_text("📎 Procesando PDF...")
+        f       = await doc.get_file()
+        image_bytes = bytes(await f.download_as_bytearray())
+        mime_type   = "application/pdf"
+        raw_text    = "[PDF]"
+        await loading.delete()
+
+    else:
+        await update.message.reply_text(
+            "❌ No reconocí ese formato. Envía texto, foto o PDF."
+        )
+        return MINUTA_WAIT
+
+    loading = await update.message.reply_text("🤖 Extrayendo tareas con Gemini...")
+
+    today_str  = datetime.now(TZ).strftime("%Y-%m-%d")
+    team_names = [info["name"].split("(")[0].strip() for _, info in get_members(team)]
+
+    try:
+        raw_tasks = await call_gemini(text, image_bytes, mime_type, team_names, today_str)
+        tasks     = enrich_tasks(raw_tasks, team)
+    except GeminiError as e:
+        await loading.delete()
+        await update.message.reply_text(
+            e.user_message(), parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Menú", callback_data="menu")]]),
+        )
+        return ConversationHandler.END
+    except Exception as e:
+        logger.error(f"Error minuta Gemini: {e}")
+        await loading.delete()
+        await update.message.reply_text("❌ Error inesperado. Intenta de nuevo.")
+        return MINUTA_WAIT
+
+    await loading.delete()
+
+    context.user_data["minuta_tasks"]    = tasks
+    context.user_data["minuta_raw_text"] = raw_text
+    context.user_data["minuta_fix_idx"]  = None
+
+    return await minuta_show_review(update, context)
+
+async def minuta_show_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra el resumen de tareas extraídas para revisión."""
+    tasks      = context.user_data.get("minuta_tasks", [])
+    need_fix   = tasks_need_fixing(tasks)
+    preview    = format_tasks_preview(tasks)
+
+    msg = f"📄 *Tareas extraídas ({len(tasks)}):*\n\n{preview}\n\n"
+
+    if need_fix:
+        msg += "⚠️ *Algunas tareas tienen datos incompletos.* Puedes corregirlas o crearlas igual."
+        buttons = [
+            [InlineKeyboardButton("✏️ Corregir incompletas",  callback_data="minuta_fix_next")],
+            [InlineKeyboardButton("✅ Crear todas igual",       callback_data="minuta_confirm_all")],
+            [InlineKeyboardButton("❌ Cancelar",               callback_data="menu")],
+        ]
+    else:
+        msg += "✅ Todas las tareas están completas. ¿Las creo en Asana?"
+        buttons = [
+            [InlineKeyboardButton("✅ Crear todas",  callback_data="minuta_confirm_all")],
+            [InlineKeyboardButton("❌ Cancelar",     callback_data="menu")],
+        ]
+
+    keyboard = InlineKeyboardMarkup(buttons)
+    if update.callback_query:
+        await update.callback_query.edit_message_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+    return MINUTA_REVIEW
+
+async def minuta_fix_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Enruta acciones de corrección de minuta."""
+    query = update.callback_query
+    await query.answer()
+    data  = query.data[len("minuta_fix_"):]
+
+    tasks    = context.user_data.get("minuta_tasks", [])
+    fix_idx  = context.user_data.get("minuta_fix_idx")
+
+    if data == "next":
+        # Buscar siguiente tarea incompleta
+        start = (fix_idx + 1) if fix_idx is not None else 0
+        idx   = next_incomplete_idx(tasks, start)
+        if idx is None:
+            return await minuta_show_review(update, context)
+        context.user_data["minuta_fix_idx"] = idx
+        task = tasks[idx]
+
+        msg = (
+            f"✏️ *Corregir tarea {idx + 1}/{len(tasks)}:*\n\n"
+            f"📌 *{task['task_name']}*\n"
+        )
+        buttons = []
+        if not task.get("assignee_tg_id"):
+            msg += "👤 *Sin responsable asignado*\n\n¿A quién se la asigno?"
+            team    = load_team()
+            members = get_members(team)
+            row     = []
+            for tid, info in members:
+                row.append(InlineKeyboardButton(
+                    get_first_name(info["name"]), callback_data=f"minuta_fix_assign_{tid}"
+                ))
+                if len(row) == 3:
+                    buttons.append(row)
+                    row = []
+            if row:
+                buttons.append(row)
+        elif not task.get("due_on"):
+            msg += "📅 *Sin fecha de vencimiento*\n\n¿Cuándo vence?"
+            today    = datetime.now(TZ).date()
+            tomorrow = today + timedelta(days=1)
+            week_end = today + timedelta(days=(4 - today.weekday()) % 7 or 7)
+            buttons = [
+                [
+                    InlineKeyboardButton(f"Hoy ({today.strftime('%d/%m')})",        callback_data=f"minuta_fix_date_{today}"),
+                    InlineKeyboardButton(f"Mañana ({tomorrow.strftime('%d/%m')})",  callback_data=f"minuta_fix_date_{tomorrow}"),
+                ],
+                [
+                    InlineKeyboardButton(f"Esta semana ({week_end.strftime('%d/%m')})", callback_data=f"minuta_fix_date_{week_end}"),
+                    InlineKeyboardButton("Sin fecha",                                    callback_data="minuta_fix_date_none"),
+                ],
+            ]
+        buttons.append([InlineKeyboardButton("⏭️ Saltar", callback_data="minuta_fix_next")])
+        buttons.append([InlineKeyboardButton("❌ Cancelar", callback_data="menu")])
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+
+    elif data.startswith("assign_"):
+        tid   = int(data[len("assign_"):])
+        team  = load_team()
+        idx   = context.user_data.get("minuta_fix_idx", 0)
+        info  = team.get(tid)
+        if info and idx < len(tasks):
+            tasks[idx]["assignee_tg_id"] = tid
+            tasks[idx]["assignee_gid"]   = info["asana_gid"]
+            tasks[idx]["assignee_name"]  = info["name"]
+            context.user_data["minuta_tasks"] = tasks
+        await minuta_fix_dispatch_next(update, context)
+
+    elif data.startswith("date_"):
+        date_str = data[len("date_"):]
+        idx      = context.user_data.get("minuta_fix_idx", 0)
+        if idx < len(tasks):
+            tasks[idx]["due_on"] = None if date_str == "none" else date_str
+            context.user_data["minuta_tasks"] = tasks
+        await minuta_fix_dispatch_next(update, context)
+
+async def minuta_fix_dispatch_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Avanza a la siguiente tarea incompleta o vuelve al resumen."""
+    tasks   = context.user_data.get("minuta_tasks", [])
+    fix_idx = context.user_data.get("minuta_fix_idx", 0)
+    next_idx = next_incomplete_idx(tasks, fix_idx + 1)
+    if next_idx is not None:
+        context.user_data["minuta_fix_idx"] = next_idx
+        # Re-trigger fix_next
+        context.user_data["minuta_fix_idx"] = next_idx - 1
+        update.callback_query.data = "minuta_fix_next"
+        await minuta_fix_dispatch(update, context)
+    else:
+        await minuta_show_review(update, context)
+
+async def minuta_confirm_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Crea todas las tareas en Asana."""
+    query  = update.callback_query
+    await query.answer()
+    tasks  = context.user_data.get("minuta_tasks", [])
+    tg_id  = update.effective_user.id
+    team   = load_team()
+
+    if not tasks:
+        await query.edit_message_text("❌ No hay tareas para crear.")
+        return ConversationHandler.END
+
+    await query.edit_message_text(f"⏳ Creando {len(tasks)} tarea(s) en Asana...")
+
+    today_str = datetime.now(TZ).strftime("%Y-%m-%d")
+    created   = []
+    errors    = []
+
+    for task in tasks:
+        if not task.get("assignee_gid"):
+            errors.append(task["task_name"])
+            continue
+        try:
+            result   = await create_asana_task(
+                task["task_name"], task["assignee_gid"], task.get("due_on")
+            )
+            task_gid = result.get("gid", "")
+            task["created_gid"] = task_gid
+
+            # Fix doble notificación + agregar al proyecto
+            agid = task["assignee_gid"]
+            if agid not in known_tasks:
+                known_tasks[agid] = set()
+            known_tasks[agid].add(task_gid)
+            try:
+                await add_task_to_member_project(task_gid, agid, ASANA_TOKEN)
+            except Exception:
+                pass
+
+            if task.get("due_on") and task_gid:
+                register_unique_task(task_gid, today_str, task["due_on"])
+
+            # Notificar al responsable
+            first_name = get_first_name(task["assignee_name"])
+            due_str    = due_label(task.get("due_on"))
+            try:
+                await context.bot.send_message(
+                    chat_id=task["assignee_tg_id"],
+                    text=(
+                        f"🔔 *¡Nueva tarea, {first_name}!*\n\n"
+                        f"📌 *{task['task_name']}*\n"
+                        f"📅 Vence: {due_str}"
+                    ),
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("📋 Ver mis tareas", callback_data="ver_tareas")
+                    ]]),
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+
+            created.append(task)
+        except Exception as e:
+            logger.error(f"Error creando tarea de minuta '{task['task_name']}': {e}")
+            errors.append(task["task_name"])
+
+    save_known_tasks()
+
+    # Guardar historial
+    submitter_name = team.get(tg_id, {}).get("name", "Manager")
+    record = build_minuta_record(
+        tg_id, submitter_name,
+        context.user_data.get("minuta_raw_text", ""),
+        created, TZ,
+    )
+    save_minuta(record)
+
+    msg = f"🎉 *Minuta procesada*\n\n✅ *{len(created)}* tarea(s) creada(s)"
+    if errors:
+        msg += f"\n⚠️ *{len(errors)}* sin responsable (no se crearon):\n"
+        msg += "\n".join(f"  • _{n}_" for n in errors)
+
+    await context.bot.send_message(
+        chat_id=tg_id, text=msg,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Menú", callback_data="menu")]]),
+        parse_mode="Markdown",
+    )
+
+    for key in ["minuta_tasks", "minuta_raw_text", "minuta_fix_idx"]:
+        context.user_data.pop(key, None)
+    return ConversationHandler.END
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AGREGAR MIEMBRO DEL EQUIPO DESDE TELEGRAM
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def team_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.answer()
+    msg = (
+        "👤 *Agregar nuevo miembro*\n\n"
+        "Escribe el *nombre completo* del colaborador\n"
+        "_(incluye su área, ej: \"Andrea García (Ventas)\")_"
+    )
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="menu")]])
+    if query:
+        await query.edit_message_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+    return TEAM_ADD_NAME
+
+async def team_add_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_member"] = {"name": update.message.text.strip()}
+    await update.message.reply_text(
+        "📱 Ahora pídele al colaborador que abra el bot y escriba `/mi_id`\n\n"
+        "Cuando tengas su ID, escríbelo aquí:"
+    )
+    return TEAM_ADD_TGID
+
+async def team_add_receive_tgid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        tg_id = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ Eso no parece un ID válido. Escribe solo números:")
+        return TEAM_ADD_TGID
+    context.user_data["new_member"]["tg_id"] = tg_id
+    await update.message.reply_text(
+        "🔗 Por último, necesito su *GID de Asana*.\n\n"
+        "Lo encuentras en:\n"
+        f"`https://app.asana.com/api/1.0/users?workspace={ASANA_WORKSPACE}`\n\n"
+        "Escribe el GID (solo números):",
+        parse_mode="Markdown",
+    )
+    return TEAM_ADD_ASANA
+
+async def team_add_receive_asana(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    asana_gid = update.message.text.strip()
+    context.user_data["new_member"]["asana_gid"] = asana_gid
+
+    member = context.user_data["new_member"]
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Confirmar y agregar", callback_data="team_add_confirm")],
+        [InlineKeyboardButton("❌ Cancelar",            callback_data="menu")],
+    ])
+    await update.message.reply_text(
+        f"👤 *Confirmar nuevo miembro:*\n\n"
+        f"📛 Nombre: *{member['name']}*\n"
+        f"📱 Telegram ID: `{member['tg_id']}`\n"
+        f"🔗 Asana GID: `{asana_gid}`\n\n"
+        f"Se creará su proyecto en Asana automáticamente.",
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+    )
+    return TEAM_ADD_ASANA
+
+async def team_add_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query  = update.callback_query
+    await query.answer()
+    member = context.user_data.pop("new_member", {})
+    if not member:
+        await query.edit_message_text("❌ Error: no hay datos del nuevo miembro.")
+        return ConversationHandler.END
+
+    await query.edit_message_text("⏳ Agregando miembro y creando su proyecto en Asana...")
+
+    # Agregar a team.txt
+    success = add_member(member["tg_id"], member["asana_gid"], member["name"])
+    if not success:
+        await context.bot.send_message(
+            chat_id=MANAGER_CHAT_ID,
+            text="❌ El Telegram ID ya existe en team.txt. Verifica el archivo.",
+        )
+        return ConversationHandler.END
+
+    # Crear proyecto en Asana
+    try:
+        await ensure_member_project(
+            member["asana_gid"], member["name"], ASANA_WORKSPACE, ASANA_TOKEN
+        )
+        project_ok = True
+    except Exception as e:
+        logger.error(f"Error creando proyecto para {member['name']}: {e}")
+        project_ok = False
+
+    msg = (
+        f"✅ *{member['name']}* fue agregado al equipo.\n\n"
+        f"📱 Telegram ID: `{member['tg_id']}`\n"
+    )
+    msg += "📁 Proyecto en Asana creado ✅" if project_ok else "⚠️ No se pudo crear el proyecto en Asana. Revisa el token."
+
+    # Notificar al nuevo miembro
+    try:
+        await context.bot.send_message(
+            chat_id=member["tg_id"],
+            text=(
+                f"👋 *¡Bienvenido/a al equipo, {member['name'].split()[0]}!*\n\n"
+                "Ya estás registrado/a en el bot de Lubrikca.\n"
+                "Escribe /menu para ver tus tareas."
+            ),
+            parse_mode="Markdown",
+        )
+    except Exception:
+        msg += "\n⚠️ No pude notificar al nuevo miembro (verifica el Telegram ID)."
+
+    await context.bot.send_message(
+        chat_id=MANAGER_CHAT_ID, text=msg, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Menú", callback_data="menu")]]),
+    )
+    return ConversationHandler.END
+
+# ── POST-INIT: crea proyectos Asana para todos los miembros al arrancar ────────
+
+async def post_init(application: Application) -> None:
+    """Crea (o verifica) el proyecto Kanban en Asana de cada miembro del equipo."""
+    if not ASANA_TOKEN or not ASANA_WORKSPACE:
+        logger.warning("post_init: ASANA_TOKEN o ASANA_WORKSPACE no configurados, omitiendo.")
+        return
+    team = load_team()
+    for tg_id, info in team.items():
+        if tg_id == MANAGER_CHAT_ID:
+            continue
+        try:
+            await ensure_member_project(
+                info["asana_gid"], info["name"], ASANA_WORKSPACE, ASANA_TOKEN
+            )
+            logger.info(f"✅ Proyecto Asana asegurado para {info['name']}")
+        except Exception as e:
+            logger.error(f"Error creando proyecto para {info['name']}: {e}")
 
 # ── MAIN ───────────────────────────────────────────────────────────────────────
 
@@ -1556,9 +2688,9 @@ async def job_sunday_summary(context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
-    # ConversationHandler para crear tareas
+    # ── ConversationHandler: manager crea tarea para un colaborador ───────────
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("tarea", crear_tarea_start),
@@ -1566,7 +2698,7 @@ def main():
         ],
         states={
             TASK_ASSIGNEE: [
-                CallbackQueryHandler(handle_assignee,    pattern="^assign_"),
+                CallbackQueryHandler(handle_assignee,                    pattern="^assign_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_task_name_text),
             ],
             TASK_DUE: [
@@ -1599,12 +2731,89 @@ def main():
         per_message=False,
     )
 
-    app.add_handler(conv_handler)
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("menu",   cmd_menu))
-    app.add_handler(CommandHandler("mi_id",  cmd_mi_id))
-    app.add_handler(CallbackQueryHandler(button_handler))
+    # ── ConversationHandler: colaborador crea su propia tarea ─────────────────
+    self_task_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(self_task_start, pattern="^self_task_start$")],
+        states={
+            SELF_TASK_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, self_task_receive_name),
+            ],
+            SELF_TASK_DUE: [
+                CallbackQueryHandler(self_task_due, pattern="^sdue_"),
+            ],
+            SELF_TASK_DUE_CUSTOM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, self_task_due_custom),
+            ],
+        },
+        fallbacks=[
+            CallbackQueryHandler(show_main_menu, pattern="^menu$"),
+            CommandHandler("menu", cmd_menu),
+        ],
+        per_message=False,
+    )
 
+    # ── ConversationHandler: cargar minuta de reunión ─────────────────────────
+    minuta_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(minuta_start, pattern="^minuta_start$")],
+        states={
+            MINUTA_WAIT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, minuta_receive),
+                MessageHandler(filters.PHOTO,                   minuta_receive),
+                MessageHandler(filters.Document.ALL,            minuta_receive),
+            ],
+            MINUTA_REVIEW: [
+                CallbackQueryHandler(minuta_fix_dispatch, pattern="^minuta_fix_"),
+                CallbackQueryHandler(minuta_confirm_all,  pattern="^minuta_confirm_all$"),
+            ],
+            MINUTA_FIX_ASSIGN: [
+                CallbackQueryHandler(minuta_fix_dispatch, pattern="^minuta_fix_"),
+            ],
+            MINUTA_FIX_DATE: [
+                CallbackQueryHandler(minuta_fix_dispatch, pattern="^minuta_fix_"),
+            ],
+        },
+        fallbacks=[
+            CallbackQueryHandler(show_main_menu, pattern="^menu$"),
+            CommandHandler("menu", cmd_menu),
+        ],
+        per_message=False,
+    )
+
+    # ── ConversationHandler: agregar nuevo miembro desde Telegram ─────────────
+    team_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(team_add_start, pattern="^team_add_start$")],
+        states={
+            TEAM_ADD_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, team_add_receive_name),
+            ],
+            TEAM_ADD_TGID: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, team_add_receive_tgid),
+            ],
+            TEAM_ADD_ASANA: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, team_add_receive_asana),
+                CallbackQueryHandler(team_add_confirm_handler,   pattern="^team_add_confirm$"),
+            ],
+        },
+        fallbacks=[
+            CallbackQueryHandler(show_main_menu, pattern="^menu$"),
+            CommandHandler("menu", cmd_menu),
+        ],
+        per_message=False,
+    )
+
+    # ── Registrar handlers (orden importa: ConversationHandlers primero) ───────
+    app.add_handler(conv_handler)
+    app.add_handler(self_task_handler)
+    app.add_handler(minuta_handler)
+    app.add_handler(team_handler)
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu",  cmd_menu))
+    app.add_handler(CommandHandler("mi_id", cmd_mi_id))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    # Texto libre: comentarios, NL tasks, fechas custom para NL
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_free_text))
+
+    # ── Jobs programados ───────────────────────────────────────────────────────
     jq = app.job_queue
     jq.run_daily(job_morning,        time(MORNING_HOUR,   MORNING_MIN,   tzinfo=TZ))
     jq.run_daily(job_afternoon,      time(AFTERNOON_HOUR, AFTERNOON_MIN, tzinfo=TZ))
@@ -1623,7 +2832,12 @@ def main():
     jq.run_repeating(job_process_recurring,         interval=60 * 30, first=30)
     jq.run_repeating(job_check_recurring_completed, interval=60 * 60, first=60)
 
-    logger.info(f"✅ Bot Lubrikca v5.0 listo | Recordatorios: {MORNING_HOUR}:00 y {AFTERNOON_HOUR}:00 | Reporte: {REPORT_HOUR}:00 | Escalación activa")
+    logger.info(
+        f"✅ Bot Lubrikca v6.0 listo | "
+        f"Recordatorios: {MORNING_HOUR}:00 y {AFTERNOON_HOUR}:00 | "
+        f"Reporte: {REPORT_HOUR}:00 | Escalación activa | "
+        f"Funciones v6: tarea propia, minuta IA, equipo desde Telegram, NL tasks"
+    )
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
