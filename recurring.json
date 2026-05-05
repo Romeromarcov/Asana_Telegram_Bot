@@ -1,0 +1,88 @@
+[
+  {
+    "task_name": "Informe semanal a Raúl",
+    "assignee_gid": "1145691884287606",
+    "assignee_tg_id": 5269337388,
+    "assignee_name": "Marco Vinicio (Manager)",
+    "freq": "weekly",
+    "weekday": 4,
+    "due_on": "2026-05-08",
+    "last_task_gid": "1214526982740033",
+    "last_created": "2026-05-08",
+    "pending_count": 1
+  },
+  {
+    "task_name": "Reporte de ventas — Gerencia General",
+    "assignee_gid": "1214167186224930",
+    "assignee_tg_id": 5399960075,
+    "assignee_name": "Ronald Cáseres (Supervisor Ventas)",
+    "freq": "weekly",
+    "weekday": 2,
+    "due_on": "2026-05-06",
+    "last_task_gid": "1214527161330939",
+    "last_created": "2026-05-06",
+    "pending_count": 1
+  },
+  {
+    "task_name": "Visita a clientes (1 cliente por semana)",
+    "assignee_gid": "1214167186224930",
+    "assignee_tg_id": 5399960075,
+    "assignee_name": "Ronald Cáseres (Supervisor Ventas)",
+    "freq": "weekly",
+    "weekday": 2,
+    "due_on": "2026-05-06",
+    "last_task_gid": "1214526981835961",
+    "last_created": "2026-05-06",
+    "pending_count": 1
+  },
+  {
+    "task_name": "Procesar 20 pedidos diarios",
+    "assignee_gid": "1214167186224930",
+    "assignee_tg_id": 5399960075,
+    "assignee_name": "Ronald Cáseres (Supervisor Ventas)",
+    "freq": "intraday",
+    "times_per_day": 1,
+    "hours": [9],
+    "due_on": "2026-05-05",
+    "last_task_gid": "1214526899357572",
+    "last_created": "2026-05-05",
+    "last_intraday_hour": "2026-05-05-9",
+    "pending_count": 1
+  },
+  {
+    "task_name": "Informe a Raúl — Logística (martes)",
+    "assignee_gid": "1214167186224933",
+    "assignee_tg_id": 6303685785,
+    "assignee_name": "Luis Laya (Almacén)",
+    "freq": "weekly",
+    "weekday": 1,
+    "due_on": "2026-05-05",
+    "last_task_gid": "1214527161663348",
+    "last_created": "2026-05-05",
+    "pending_count": 1
+  },
+  {
+    "task_name": "Informe a Raúl — Logística (viernes)",
+    "assignee_gid": "1214167186224933",
+    "assignee_tg_id": 6303685785,
+    "assignee_name": "Luis Laya (Almacén)",
+    "freq": "weekly",
+    "weekday": 4,
+    "due_on": "2026-05-08",
+    "last_task_gid": "1214551378673525",
+    "last_created": "2026-05-08",
+    "pending_count": 1
+  },
+  {
+    "task_name": "Informe semanal a Raúl — Cobranza",
+    "assignee_gid": "1214167186224936",
+    "assignee_tg_id": 8650936398,
+    "assignee_name": "Alexandra (Atención al Cliente)",
+    "freq": "weekly",
+    "weekday": 3,
+    "due_on": "2026-05-07",
+    "last_task_gid": "1214527067123415",
+    "last_created": "2026-05-07",
+    "pending_count": 1
+  }
+]
