@@ -38,16 +38,23 @@ def save_minuta(minuta: dict):
 # ── PROMPT PARA GEMINI ────────────────────────────────────────────────────────
 
 def build_prompt(text: str, team_names: list[str], today_str: str) -> str:
-    names = ", ".join(team_names)
+    team_desc = "\n".join(f"  - {n}" for n in team_names)
     return (
-        f"Hoy es {today_str}. El equipo disponible es: {names}.\n\n"
+        f"Hoy es {today_str}.\n\n"
+        f"Equipo disponible (nombre + área entre paréntesis):\n{team_desc}\n\n"
         "Eres un asistente experto en gestión de proyectos. "
         "Extrae TODAS las tareas, compromisos y acciones pendientes de la minuta.\n\n"
         "Reglas estrictas:\n"
         "1. Devuelve ÚNICAMENTE un JSON array válido. Sin texto adicional, sin markdown.\n"
-        "2. assignee_name: usa uno de los nombres del equipo (el más cercano), o null.\n"
-        "3. due_on: fecha en formato YYYY-MM-DD. Interpreta expresiones como 'viernes', "
-        "'próxima semana', 'en 3 días' usando hoy como referencia. Si no hay fecha: null.\n"
+        "2. assignee_name: usa el nombre base (sin área) de uno de los miembros del equipo.\n"
+        "   - Si se menciona un nombre explícitamente, úsalo.\n"
+        "   - Si NO se menciona nombre pero el contexto indica un área "
+        "(ej: 'ventas' → Ventas, 'almacén'/'logística' → Almacén, "
+        "'cobranza'/'cobro' → Cobranza/Atención, 'administración'/'admin' → Administración), "
+        "asigna al miembro de esa área.\n"
+        "   - Si no puedes inferir el responsable con razonable certeza, usa null.\n"
+        "3. due_on: fecha en formato YYYY-MM-DD. Interpreta 'viernes', 'próxima semana', "
+        "'en 3 días' usando hoy como referencia. Si no hay fecha: null.\n"
         "4. notes: contexto adicional útil para ejecutar la tarea, o null.\n"
         "5. Si no hay tareas claras en el texto, devuelve [].\n\n"
         "Formato de respuesta (solo esto, nada más):\n"

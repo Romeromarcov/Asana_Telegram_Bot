@@ -1626,7 +1626,7 @@ async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loading = await update.message.reply_text("🤖 Analizando...")
 
     today_str  = datetime.now(TZ).strftime("%Y-%m-%d")
-    team_names = [info["name"].split("(")[0].strip() for _, info in get_members(team)]
+    team_names = [info["name"] for _, info in get_members(team)]
 
     try:
         raw_tasks = await call_gemini(text, None, None, team_names, today_str)
@@ -1892,7 +1892,7 @@ async def minuta_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loading = await update.message.reply_text("🤖 Extrayendo tareas con Gemini...")
 
     today_str  = datetime.now(TZ).strftime("%Y-%m-%d")
-    team_names = [info["name"].split("(")[0].strip() for _, info in get_members(team)]
+    team_names = [info["name"] for _, info in get_members(team)]
 
     try:
         raw_tasks = await call_gemini(text, image_bytes, mime_type, team_names, today_str)
