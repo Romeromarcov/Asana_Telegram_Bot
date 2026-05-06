@@ -256,43 +256,42 @@ async def remove_team_member(tg_id: int, _=Depends(check_auth)):
 
 @app.get("/api/config")
 async def api_config(_=Depends(check_auth)):
-    saved = load_saved_config()
-    def v(key, default):
-        return saved.get(key, os.environ.get(key, default))
+    """Devuelve la configuración activa del sistema (leída de variables de entorno)."""
+    def ev(key, default):
+        return os.environ.get(key, default)
     return {
-        "TIMEZONE":               v("TIMEZONE", "America/Caracas"),
-        "MORNING_HOUR":           int(v("MORNING_HOUR", "9")),
-        "MORNING_MIN":            int(v("MORNING_MIN", "0")),
-        "AFTERNOON_HOUR":         int(v("AFTERNOON_HOUR", "15")),
-        "AFTERNOON_MIN":          int(v("AFTERNOON_MIN", "0")),
-        "REPORT_HOUR":            int(v("REPORT_HOUR", "18")),
-        "REPORT_MIN":             int(v("REPORT_MIN", "0")),
-        "CHECK_INTERVAL_MINUTES": int(v("CHECK_INTERVAL_MINUTES", "5")),
-        "_has_overrides":         CFG_FILE.exists(),
+        "TIMEZONE":               ev("TIMEZONE",               "America/Caracas"),
+        "MORNING_HOUR":           int(ev("MORNING_HOUR",        "9")),
+        "MORNING_MIN":            int(ev("MORNING_MIN",         "0")),
+        "AFTERNOON_HOUR":         int(ev("AFTERNOON_HOUR",      "15")),
+        "AFTERNOON_MIN":          int(ev("AFTERNOON_MIN",       "0")),
+        "REPORT_HOUR":            int(ev("REPORT_HOUR",         "18")),
+        "REPORT_MIN":             int(ev("REPORT_MIN",          "0")),
+        "CHECK_INTERVAL_MINUTES": int(ev("CHECK_INTERVAL_MINUTES", "5")),
+        "_note": "Para modificar la configuración actualiza las variables de entorno en Railway.",
     }
 
 @app.post("/api/config")
 async def save_config(request: Request, _=Depends(check_auth)):
-    body    = await request.json()
-    allowed = {
-        "TIMEZONE", "MORNING_HOUR", "MORNING_MIN",
-        "AFTERNOON_HOUR", "AFTERNOON_MIN",
-        "REPORT_HOUR", "REPORT_MIN", "CHECK_INTERVAL_MINUTES",
+    """
+    Nota: en la arquitectura de dos servicios (Web + Worker), los cambios
+    de configuración deben hacerse en las Variables de Entorno de Railway
+    (servicio Worker) y re-desplegar el Worker para que tengan efecto.
+    Este endpoint es informativo.
+    """
+    return {
+        "ok": False,
+        "message": (
+            "Para cambiar la configuración ve a Railway → servicio Worker → Variables "
+            "y actualiza las variables de entorno (TIMEZONE, MORNING_HOUR, etc.). "
+            "El Worker se re-desplegará automáticamente."
+        ),
     }
-    clean = {}
-    for k, val in body.items():
-        if k not in allowed:
-            continue
-        clean[k] = int(val) if k != "TIMEZONE" else str(val)
-    CFG_FILE.write_text(json.dumps(clean, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"ok": True}
 
 @app.delete("/api/config")
 async def reset_config(_=Depends(check_auth)):
-    """Elimina overrides → el bot usa env vars de Railway."""
-    if CFG_FILE.exists():
-        CFG_FILE.unlink()
-    return {"ok": True}
+    """No-op en arquitectura de dos servicios; la config viene de env vars."""
+    return {"ok": True, "message": "La configuración se gestiona via variables de entorno."}
 
 @app.get("/health")
 async def health():

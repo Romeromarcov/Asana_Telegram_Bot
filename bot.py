@@ -54,31 +54,21 @@ MANAGER_CHAT_ID = int(_require_env("MANAGER_CHAT_ID"))
 GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
 
 # Archivos de datos
-RECURRING_FILE      = Path(__file__).parent / "recurring.json"
-KNOWN_TASKS_FILE    = Path(__file__).parent / "known_tasks.json"
-DASHBOARD_CFG_FILE  = Path(__file__).parent / "dashboard_config.json"
+RECURRING_FILE   = Path(__file__).parent / "recurring.json"
+KNOWN_TASKS_FILE = Path(__file__).parent / "known_tasks.json"
 
-# ── Config dinámica: env vars + overrides del panel web ───────────────────────
-def _load_dashboard_cfg() -> dict:
-    """Lee dashboard_config.json si existe (escrito por el panel web)."""
-    if not DASHBOARD_CFG_FILE.exists():
-        return {}
-    try:
-        return json.loads(DASHBOARD_CFG_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-def _cfg(key: str, default: str) -> str:
-    return str(_load_dashboard_cfg().get(key, os.environ.get(key, default)))
-
-TIMEZONE               = _cfg("TIMEZONE",               "America/Caracas")
-MORNING_HOUR           = int(_cfg("MORNING_HOUR",        "9"))
-MORNING_MIN            = int(_cfg("MORNING_MIN",         "0"))
-AFTERNOON_HOUR         = int(_cfg("AFTERNOON_HOUR",      "15"))
-AFTERNOON_MIN          = int(_cfg("AFTERNOON_MIN",       "0"))
-REPORT_HOUR            = int(_cfg("REPORT_HOUR",         "18"))
-REPORT_MIN             = int(_cfg("REPORT_MIN",          "0"))
-CHECK_INTERVAL_MINUTES = int(_cfg("CHECK_INTERVAL_MINUTES", "5"))
+# ── Config desde variables de entorno ─────────────────────────────────────────
+# Los cambios de configuración del panel web se aplican vía env vars en Railway.
+# (Los servicios Web y Worker tienen filesystems separados; dashboard_config.json
+#  escrito por el panel NO llega al Worker → se usa directamente os.environ.)
+TIMEZONE               = os.environ.get("TIMEZONE",               "America/Caracas")
+MORNING_HOUR           = int(os.environ.get("MORNING_HOUR",        "9"))
+MORNING_MIN            = int(os.environ.get("MORNING_MIN",         "0"))
+AFTERNOON_HOUR         = int(os.environ.get("AFTERNOON_HOUR",      "15"))
+AFTERNOON_MIN          = int(os.environ.get("AFTERNOON_MIN",       "0"))
+REPORT_HOUR            = int(os.environ.get("REPORT_HOUR",         "18"))
+REPORT_MIN             = int(os.environ.get("REPORT_MIN",          "0"))
+CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "5"))
 
 TZ = pytz.timezone(TIMEZONE)
 
