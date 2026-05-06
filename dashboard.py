@@ -20,11 +20,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-import httpx
 import pytz
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+
+from utils import ASANA_BASE, load_team, http_client
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +37,6 @@ TIMEZONE        = os.environ.get("TIMEZONE", "America/Caracas")
 DASHBOARD_PASS  = os.environ.get("DASHBOARD_PASSWORD", "")
 MANAGER_TG_ID   = int(os.environ.get("MANAGER_CHAT_ID", "0"))
 TZ              = pytz.timezone(TIMEZONE)
-ASANA_BASE      = "https://app.asana.com/api/1.0"
 CFG_FILE        = BASE_DIR / "dashboard_config.json"
 
 AREA_COLORS = {
@@ -61,22 +61,6 @@ def check_auth(credentials: HTTPBasicCredentials = Depends(security)):
         raise HTTPException(status_code=401, headers={"WWW-Authenticate": "Basic"})
     return True
 
-# ── Data helpers ───────────────────────────────────────────────────────────────
-def load_team() -> dict:
-    team = {}
-    try:
-        for line in (BASE_DIR / "team.txt").read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "|" not in line:
-                continue
-            parts = [p.strip() for p in line.split("|")]
-            if len(parts) < 3:
-                continue
-            tg_id = int(parts[0])
-            team[tg_id] = {"asana_gid": parts[1], "name": parts[2]}
-    except Exception:
-        pass
-    return team
 
 def load_recurring() -> list:
     try:
@@ -120,10 +104,9 @@ async def asana_get_tasks(asana_gid: str) -> list:
         "limit": 50,
     }
     try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(f"{ASANA_BASE}/tasks", headers=headers, params=params, timeout=10)
-            r.raise_for_status()
-            return r.json().get("data", [])
+        r = await http_client.get(f"{ASANA_BASE}/tasks", headers=headers, params=params)
+        r.raise_for_status()
+        return r.json().get("data", [])
     except Exception:
         return []
 
@@ -131,13 +114,12 @@ async def asana_task_completed(gid: str) -> bool:
     if not ASANA_TOKEN or not gid:
         return False
     try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(
-                f"{ASANA_BASE}/tasks/{gid}",
-                headers={"Authorization": f"Bearer {ASANA_TOKEN}"},
-                params={"opt_fields": "completed"}, timeout=8,
-            )
-            return r.json().get("data", {}).get("completed", False)
+        r = await http_client.get(
+            f"{ASANA_BASE}/tasks/{gid}",
+            headers={"Authorization": f"Bearer {ASANA_TOKEN}"},
+            params={"opt_fields": "completed"},
+        )
+        return r.json().get("data", {}).get("completed", False)
     except Exception:
         return False
 

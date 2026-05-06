@@ -9,13 +9,13 @@ import logging
 from datetime import datetime, time, date, timedelta
 from pathlib import Path
 import pytz
-import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     ContextTypes, ConversationHandler, MessageHandler, filters
 )
 
+from utils import ASANA_BASE, load_team, http_client
 from mover_tareas import (
     get_task_projects, get_workspace_projects,
     get_project_sections, move_task_to_section,
@@ -52,7 +52,6 @@ ASANA_TOKEN     = _require_env("ASANA_TOKEN")
 ASANA_WORKSPACE = _require_env("ASANA_WORKSPACE_ID")
 MANAGER_CHAT_ID = int(_require_env("MANAGER_CHAT_ID"))
 GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
-ASANA_BASE      = "https://app.asana.com/api/1.0"
 
 # Archivos de datos
 RECURRING_FILE      = Path(__file__).parent / "recurring.json"
@@ -134,30 +133,6 @@ known_tasks: dict[str, set] = load_known_tasks()
     TEAM_ADD_ASANA,
 ) = range(18)
 
-# ── CARGA DEL EQUIPO ───────────────────────────────────────────────────────────
-
-def load_team() -> dict:
-    team = {}
-    team_file = Path(__file__).parent / "team.txt"
-    if not team_file.exists():
-        return team
-    for line in team_file.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = [p.strip() for p in line.split("|")]
-        if len(parts) < 2:
-            continue
-        try:
-            tg_id = int(parts[0])
-            team[tg_id] = {
-                "asana_gid": parts[1],
-                "name": parts[2] if len(parts) > 2 else f"Usuario {tg_id}"
-            }
-        except ValueError:
-            pass
-    return team
-
 def get_members(team: dict) -> list:
     """Devuelve miembros del equipo sin el manager."""
     return [(tid, info) for tid, info in team.items() if tid != MANAGER_CHAT_ID]
@@ -190,24 +165,21 @@ def update_recurring(idx: int, config: dict):
 
 async def asana_get(path: str, params: dict = None) -> dict:
     headers = {"Authorization": f"Bearer {ASANA_TOKEN}"}
-    async with httpx.AsyncClient() as client:
-        r = await client.get(f"{ASANA_BASE}{path}", headers=headers, params=params, timeout=15)
-        r.raise_for_status()
-        return r.json()
+    r = await http_client.get(f"{ASANA_BASE}{path}", headers=headers, params=params)
+    r.raise_for_status()
+    return r.json()
 
 async def asana_post(path: str, data: dict) -> dict:
     headers = {"Authorization": f"Bearer {ASANA_TOKEN}", "Content-Type": "application/json"}
-    async with httpx.AsyncClient() as client:
-        r = await client.post(f"{ASANA_BASE}{path}", headers=headers, json={"data": data}, timeout=15)
-        r.raise_for_status()
-        return r.json()
+    r = await http_client.post(f"{ASANA_BASE}{path}", headers=headers, json={"data": data})
+    r.raise_for_status()
+    return r.json()
 
 async def asana_put(path: str, data: dict) -> dict:
     headers = {"Authorization": f"Bearer {ASANA_TOKEN}", "Content-Type": "application/json"}
-    async with httpx.AsyncClient() as client:
-        r = await client.put(f"{ASANA_BASE}{path}", headers=headers, json={"data": data}, timeout=15)
-        r.raise_for_status()
-        return r.json()
+    r = await http_client.put(f"{ASANA_BASE}{path}", headers=headers, json={"data": data})
+    r.raise_for_status()
+    return r.json()
 
 async def get_pending_tasks(asana_gid: str) -> list:
     params = {
@@ -2520,14 +2492,16 @@ async def mover_ejecutar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 from escalation import (
     should_remind_before_due, should_escalate_overdue,
     mark_alert_sent, is_task_blocked, block_task, cleanup_alert_state,
+    load_alert_state, save_alert_state,
     get_freq_for_task, days_until_due, hours_since_due,
     register_unique_task, DAYS_LABEL,
 )
 
 async def job_escalation(context: ContextTypes.DEFAULT_TYPE, session: str = "pm"):
-    team     = load_team()
-    rec_data = load_recurring()
-    all_gids = set()
+    team        = load_team()
+    rec_data    = load_recurring()
+    all_gids    = set()
+    alert_state = load_alert_state()   # carga ÚNICA — se pasa a todas las funciones
 
     for tg_id, info in team.items():
         if tg_id == MANAGER_CHAT_ID:
@@ -2549,9 +2523,10 @@ async def job_escalation(context: ContextTypes.DEFAULT_TYPE, session: str = "pm"
 
             first_name = get_first_name(info["name"])
 
-            pre_alerts = should_remind_before_due(gid, due_on, freq, TZ)
+            # sin I/O: pasa alert_state en memoria
+            pre_alerts = should_remind_before_due(gid, due_on, freq, TZ, state=alert_state)
             for alert_key in pre_alerts:
-                days = days_until_due(due_on, TZ)
+                days  = days_until_due(due_on, TZ)
                 label = DAYS_LABEL.get(alert_key, f"{days} día(s)")
                 msg = (
                     f"⏰ *Recordatorio, {first_name}*\n\n"
@@ -2566,31 +2541,32 @@ async def job_escalation(context: ContextTypes.DEFAULT_TYPE, session: str = "pm"
                     await context.bot.send_message(
                         chat_id=tg_id, text=msg,
                         reply_markup=keyboard, parse_mode="Markdown")
-                    mark_alert_sent(gid, alert_key)
+                    mark_alert_sent(gid, alert_key, state=alert_state)   # sin I/O
                     logger.info(f"Alerta anticipada '{alert_key}' → {info['name']}: {task['name']}")
                 except Exception as e:
                     logger.error(f"Error alerta anticipada: {e}")
 
-            if is_task_blocked(gid):
+            if is_task_blocked(gid, state=alert_state):   # sin I/O
                 continue
 
-            esc_key, should_block = should_escalate_overdue(gid, due_on, session, TZ)
+            esc_key, should_block = should_escalate_overdue(
+                gid, due_on, session, TZ, state=alert_state)   # sin I/O
             if not esc_key:
                 continue
 
             hours = hours_since_due(due_on, TZ) or 0
 
             if hours < 24:
-                icon = "⚠️"
+                icon  = "⚠️"
                 level = "Tarea vencida"
             elif hours < 48:
-                icon = "🚨"
+                icon  = "🚨"
                 level = "Vencida +24h — sin completar"
             elif hours < 72:
-                icon = "🔴"
+                icon  = "🔴"
                 level = "URGENTE — Vencida +48h"
             else:
-                icon = "⛔"
+                icon  = "⛔"
                 level = "CRÍTICO — Bloqueada +72h"
 
             hours_int = int(hours)
@@ -2613,14 +2589,15 @@ async def job_escalation(context: ContextTypes.DEFAULT_TYPE, session: str = "pm"
                 await context.bot.send_message(
                     chat_id=MANAGER_CHAT_ID, text=esc_msg,
                     reply_markup=keyboard_mgr, parse_mode="Markdown")
-                mark_alert_sent(gid, esc_key)
+                mark_alert_sent(gid, esc_key, state=alert_state)   # sin I/O
                 if should_block:
-                    block_task(gid)
+                    block_task(gid, state=alert_state)              # sin I/O
                 logger.info(f"Escalación '{esc_key}' → manager: {info['name']} / {task['name']}")
             except Exception as e:
                 logger.error(f"Error escalación: {e}")
 
-    cleanup_alert_state(all_gids)
+    cleanup_alert_state(all_gids, state=alert_state)   # limpia en memoria
+    save_alert_state(alert_state)                       # guarda ÚNICA vez
 
 async def job_escalation_am(context: ContextTypes.DEFAULT_TYPE):
     await job_escalation(context, session="am")

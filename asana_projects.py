@@ -12,11 +12,10 @@ entre secciones (cambio de estado).
 import json
 import logging
 from pathlib import Path
-import httpx
+
+from utils import ASANA_BASE, http_client
 
 logger = logging.getLogger(__name__)
-
-ASANA_BASE    = "https://app.asana.com/api/1.0"
 PROJECTS_FILE = Path(__file__).parent / "projects.json"
 
 STANDARD_SECTIONS = [
@@ -50,15 +49,13 @@ async def _asana_post(path: str, data: dict, asana_token: str) -> dict:
         "Authorization": f"Bearer {asana_token}",
         "Content-Type": "application/json",
     }
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            f"{ASANA_BASE}{path}",
-            headers=headers,
-            json={"data": data},
-            timeout=15,
-        )
-        r.raise_for_status()
-        return r.json().get("data", {})
+    r = await http_client.post(
+        f"{ASANA_BASE}{path}",
+        headers=headers,
+        json={"data": data},
+    )
+    r.raise_for_status()
+    return r.json().get("data", {})
 
 # ── CREACIÓN DE PROYECTO ───────────────────────────────────────────────────────
 
@@ -116,34 +113,28 @@ async def find_project_in_asana(
     headers      = {"Authorization": f"Bearer {asana_token}"}
 
     try:
-        async with httpx.AsyncClient() as client:
-            # Listar proyectos del workspace
-            r = await client.get(
-                f"{ASANA_BASE}/projects",
-                headers=headers,
-                params={"workspace": workspace_gid, "opt_fields": "name,gid,created_at", "limit": 100},
-                timeout=15,
-            )
-            r.raise_for_status()
-            matches = [
-                p for p in r.json().get("data", []) if p["name"] == project_name
-            ]
-            if not matches:
-                return None
-            # Si hay varios, conservar el más antiguo (menor created_at)
-            found = min(matches, key=lambda p: p.get("created_at", ""))
+        # Listar proyectos del workspace
+        r = await http_client.get(
+            f"{ASANA_BASE}/projects",
+            headers=headers,
+            params={"workspace": workspace_gid, "opt_fields": "name,gid,created_at", "limit": 100},
+        )
+        r.raise_for_status()
+        matches = [p for p in r.json().get("data", []) if p["name"] == project_name]
+        if not matches:
+            return None
+        # Si hay varios, conservar el más antiguo (menor created_at)
+        found       = min(matches, key=lambda p: p.get("created_at", ""))
+        project_gid = found["gid"]
 
-            project_gid = found["gid"]
-
-            # Obtener las secciones del proyecto encontrado
-            r2 = await client.get(
-                f"{ASANA_BASE}/projects/{project_gid}/sections",
-                headers=headers,
-                params={"opt_fields": "name,gid"},
-                timeout=15,
-            )
-            r2.raise_for_status()
-            sections = {s["name"]: s["gid"] for s in r2.json().get("data", [])}
+        # Obtener las secciones del proyecto encontrado
+        r2 = await http_client.get(
+            f"{ASANA_BASE}/projects/{project_gid}/sections",
+            headers=headers,
+            params={"opt_fields": "name,gid"},
+        )
+        r2.raise_for_status()
+        sections = {s["name"]: s["gid"] for s in r2.json().get("data", [])}
 
         logger.info(f"♻️  Proyecto existente encontrado en Asana para {display_name}: {project_gid}")
         return {
