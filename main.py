@@ -1,17 +1,16 @@
 """
 Entry point — corre el bot de Telegram + el panel web en el mismo proceso.
 
-  Bot polling  → hilo principal (blocking)
-  Dashboard    → hilo de fondo (FastAPI + uvicorn en daemon thread)
+  Dashboard  → hilo PRINCIPAL  (uvicorn + FastAPI, Railway expone el PORT aquí)
+  Bot        → hilo DAEMON      (PTB long-polling, crea su propio event loop)
 
-Railway expone el puerto $PORT al dashboard; el bot usa long polling.
-
-NOTA: Uvicorn sólo puede registrar signal handlers desde el hilo principal.
-      Por eso usamos DashboardServer que sobrescribe install_signal_handlers.
+Por qué así:
+  - Railway hace health-check al PORT inmediatamente al arrancar.
+  - Uvicorn solo puede registrar SIGTERM/SIGINT desde el hilo principal.
+  - PTB internamente llama asyncio.run() → funciona perfecto en un thread aparte.
 """
 
 import os
-import asyncio
 import threading
 import logging
 
@@ -21,26 +20,13 @@ from dashboard import app as dashboard_app
 logger = logging.getLogger(__name__)
 
 
-class DashboardServer(uvicorn.Server):
-    """Uvicorn server que puede correr en un hilo no-principal sin crashear."""
-
-    def install_signal_handlers(self) -> None:
-        # Los signal handlers (SIGTERM/SIGINT) solo se pueden instalar desde
-        # el hilo principal. Al omitirlos aquí evitamos el ValueError que
-        # hace que uvicorn falle silenciosamente en el daemon thread.
-        pass
-
-
-def run_dashboard() -> None:
-    port = int(os.environ.get("PORT", "8000"))
-    config = uvicorn.Config(
-        dashboard_app,
-        host="0.0.0.0",
-        port=port,
-        log_level="info",      # info para ver "Uvicorn running on …" en logs
-    )
-    server = DashboardServer(config=config)
-    asyncio.run(server.serve())
+def run_bot() -> None:
+    """Corre el bot de Telegram en su propio hilo (crea su propio event loop)."""
+    try:
+        from bot import main as bot_main
+        bot_main()
+    except Exception as e:
+        logger.error(f"❌ Bot error: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
@@ -49,11 +35,17 @@ if __name__ == "__main__":
         level=logging.INFO,
     )
 
-    # Dashboard en hilo demonio (muere si el bot muere)
-    t = threading.Thread(target=run_dashboard, daemon=True, name="dashboard")
+    # Bot en hilo daemon (muere si el proceso principal muere)
+    t = threading.Thread(target=run_bot, daemon=True, name="bot")
     t.start()
-    logger.info(f"🌐 Dashboard arrancando en puerto {os.environ.get('PORT', '8000')}")
+    logger.info("🤖 Bot Telegram iniciando en hilo daemon…")
 
-    # Bot en hilo principal (blocking — Railway lo reinicia si falla)
-    from bot import main as bot_main
-    bot_main()
+    # Dashboard en hilo PRINCIPAL — Railway ve el PORT aquí
+    port = int(os.environ.get("PORT", "8000"))
+    logger.info(f"🌐 Dashboard arrancando en puerto {port}…")
+    uvicorn.run(
+        dashboard_app,
+        host="0.0.0.0",
+        port=port,
+        log_level="info",
+    )
