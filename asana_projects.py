@@ -121,16 +121,17 @@ async def find_project_in_asana(
             r = await client.get(
                 f"{ASANA_BASE}/projects",
                 headers=headers,
-                params={"workspace": workspace_gid, "opt_fields": "name,gid", "limit": 100},
+                params={"workspace": workspace_gid, "opt_fields": "name,gid,created_at", "limit": 100},
                 timeout=15,
             )
             r.raise_for_status()
-            found = next(
-                (p for p in r.json().get("data", []) if p["name"] == project_name),
-                None,
-            )
-            if not found:
+            matches = [
+                p for p in r.json().get("data", []) if p["name"] == project_name
+            ]
+            if not matches:
                 return None
+            # Si hay varios, conservar el más antiguo (menor created_at)
+            found = min(matches, key=lambda p: p.get("created_at", ""))
 
             project_gid = found["gid"]
 
