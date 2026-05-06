@@ -101,6 +101,61 @@ async def setup_member_project(
         "sections":    sections,
     }
 
+async def find_project_in_asana(
+    display_name: str,
+    workspace_gid: str,
+    asana_token: str,
+) -> dict | None:
+    """
+    Busca en Asana si ya existe un proyecto 'Tareas - {first_name}'.
+    Si lo encuentra, reconstruye la config con sus secciones reales.
+    Evita crear duplicados cuando el filesystem de Railway es efímero.
+    """
+    first_name   = display_name.split()[0]
+    project_name = f"Tareas - {first_name}"
+    headers      = {"Authorization": f"Bearer {asana_token}"}
+
+    try:
+        async with httpx.AsyncClient() as client:
+            # Listar proyectos del workspace
+            r = await client.get(
+                f"{ASANA_BASE}/projects",
+                headers=headers,
+                params={"workspace": workspace_gid, "opt_fields": "name,gid", "limit": 100},
+                timeout=15,
+            )
+            r.raise_for_status()
+            found = next(
+                (p for p in r.json().get("data", []) if p["name"] == project_name),
+                None,
+            )
+            if not found:
+                return None
+
+            project_gid = found["gid"]
+
+            # Obtener las secciones del proyecto encontrado
+            r2 = await client.get(
+                f"{ASANA_BASE}/projects/{project_gid}/sections",
+                headers=headers,
+                params={"opt_fields": "name,gid"},
+                timeout=15,
+            )
+            r2.raise_for_status()
+            sections = {s["name"]: s["gid"] for s in r2.json().get("data", [])}
+
+        logger.info(f"♻️  Proyecto existente encontrado en Asana para {display_name}: {project_gid}")
+        return {
+            "asana_gid":   None,   # se completa en ensure_member_project
+            "name":        display_name,
+            "project_gid": project_gid,
+            "sections":    sections,
+        }
+    except Exception as e:
+        logger.warning(f"No se pudo buscar proyecto en Asana para {display_name}: {e}")
+        return None
+
+
 async def ensure_member_project(
     asana_gid: str,
     display_name: str,
@@ -109,12 +164,26 @@ async def ensure_member_project(
 ) -> dict:
     """
     Devuelve la config del proyecto del colaborador.
-    Si no existe aún, lo crea automáticamente.
+    Orden de búsqueda:
+      1. Cache local (projects.json)  → más rápido, evita llamadas API
+      2. Asana API                    → por si el cache fue borrado (redeploy)
+      3. Crear proyecto nuevo         → solo si realmente no existe
     """
     projects = load_projects()
     if asana_gid in projects:
+        logger.info(f"✅ Proyecto Asana ya existe para {display_name} (cache)")
         return projects[asana_gid]
 
+    # Buscar en Asana antes de crear
+    existing = await find_project_in_asana(display_name, workspace_gid, asana_token)
+    if existing:
+        existing["asana_gid"] = asana_gid
+        projects[asana_gid]   = existing
+        save_projects(projects)
+        logger.info(f"✅ Proyecto Asana asegurado para {display_name}")
+        return existing
+
+    # Solo llega aquí si el proyecto no existe en ningún lado
     config = await setup_member_project(
         asana_gid, display_name, workspace_gid, asana_token
     )

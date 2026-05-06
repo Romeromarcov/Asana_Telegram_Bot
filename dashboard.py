@@ -14,7 +14,10 @@ POST /api/config     → guardar overrides en dashboard_config.json
 
 import os
 import json
+import logging
 import secrets
+import threading
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -24,6 +27,8 @@ import pytz
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+
+logger = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 BASE_DIR        = Path(__file__).parent
@@ -44,7 +49,36 @@ AREA_COLORS = {
 WEEKDAY_NAMES = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
 WEEKDAY_FULL  = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 
-app = FastAPI(title="Lubrikca Dashboard", docs_url=None, redoc_url=None)
+# ── Bot launcher (arranca en daemon thread desde el lifespan) ──────────────────
+def _run_bot() -> None:
+    """Corre el bot PTB en su propio hilo con su propio event loop."""
+    try:
+        logging.basicConfig(
+            format="%(asctime)s - %(levelname)s - %(message)s",
+            level=logging.INFO,
+        )
+        from bot import main as bot_main
+        bot_main()
+    except Exception as exc:
+        logger.error("❌ Bot error: %s", exc, exc_info=True)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Arranca el bot al iniciar uvicorn; lo detiene al apagar."""
+    t = threading.Thread(target=_run_bot, daemon=True, name="bot-polling")
+    t.start()
+    logger.info("🤖 Bot Telegram arrancando en daemon thread…")
+    yield
+    # El daemon thread muere automáticamente cuando uvicorn se detiene
+
+
+app = FastAPI(
+    title="Lubrikca Dashboard",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+)
 
 # ── Auth básica opcional ───────────────────────────────────────────────────────
 security = HTTPBasic(auto_error=False)
