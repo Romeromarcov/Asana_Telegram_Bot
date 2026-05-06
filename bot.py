@@ -827,6 +827,7 @@ async def job_process_recurring(context: ContextTypes.DEFAULT_TYPE):
             if now.hour in hours and last_intraday != f"{today}-{now.hour}":
                 should_create = True
                 r["last_intraday_hour"] = f"{today}-{now.hour}"
+                changed = True   # persistir aunque la tarea falle
 
         # ── Semanal / Quincenal ───────────────────────────────────────────────
         elif freq in ("weekly", "biweekly"):
@@ -2051,14 +2052,12 @@ async def minuta_fix_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def minuta_fix_dispatch_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Avanza a la siguiente tarea incompleta o vuelve al resumen."""
-    tasks   = context.user_data.get("minuta_tasks", [])
-    fix_idx = context.user_data.get("minuta_fix_idx", 0)
+    tasks    = context.user_data.get("minuta_tasks", [])
+    fix_idx  = context.user_data.get("minuta_fix_idx", 0)
     next_idx = next_incomplete_idx(tasks, fix_idx + 1)
     if next_idx is not None:
+        # Apuntar directamente al siguiente índice incompleto y mostrar su prompt
         context.user_data["minuta_fix_idx"] = next_idx
-        # Re-trigger fix_next
-        context.user_data["minuta_fix_idx"] = next_idx - 1
-        update.callback_query.data = "minuta_fix_next"
         await minuta_fix_dispatch(update, context)
     else:
         await minuta_show_review(update, context)
