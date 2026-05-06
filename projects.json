@@ -1,0 +1,62 @@
+{
+  "1214167186224936": {
+    "asana_gid": "1214167186224936",
+    "name": "Alexandra (Atención al Cliente)",
+    "project_gid": "1214471624160131",
+    "sections": {
+      "📌 Pendiente": "1214471624160160",
+      "⚙️ En ejecución": "1214484219146275",
+      "🔍 En revisión": "1214487388641940",
+      "✅ Completado": "1214484219184551",
+      "🚫 Bloqueado": "1214489094098017"
+    }
+  },
+  "1214167186224930": {
+    "asana_gid": "1214167186224930",
+    "name": "Ronald Cáseres (Supervisor Ventas)",
+    "project_gid": "1214471624225086",
+    "sections": {
+      "📌 Pendiente": "1214471624225114",
+      "⚙️ En ejecución": "1214489094120930",
+      "🔍 En revisión": "1214487388526462",
+      "✅ Completado": "1214484219200604",
+      "🚫 Bloqueado": "1214489094107444"
+    }
+  },
+  "1214167186224921": {
+    "asana_gid": "1214167186224921",
+    "name": "Melanie Reverón (Finanzas)",
+    "project_gid": "1214484219199923",
+    "sections": {
+      "📌 Pendiente": "1214484219199951",
+      "⚙️ En ejecución": "1214484219180192",
+      "🔍 En revisión": "1214471624167613",
+      "✅ Completado": "1214489094149852",
+      "🚫 Bloqueado": "1214471823806845"
+    }
+  },
+  "1214167186224927": {
+    "asana_gid": "1214167186224927",
+    "name": "Marcos Velasco (Administración)",
+    "project_gid": "1214487388643489",
+    "sections": {
+      "📌 Pendiente": "1214487388643517",
+      "⚙️ En ejecución": "1214484219131638",
+      "🔍 En revisión": "1214471823857670",
+      "✅ Completado": "1214471624151375",
+      "🚫 Bloqueado": "1214487388628550"
+    }
+  },
+  "1214167186224933": {
+    "asana_gid": "1214167186224933",
+    "name": "Luis Laya (Almacén)",
+    "project_gid": "1214489094121106",
+    "sections": {
+      "📌 Pendiente": "1214489094121134",
+      "⚙️ En ejecución": "1214489094129746",
+      "🔍 En revisión": "1214487388641815",
+      "✅ Completado": "1214471823806843",
+      "🚫 Bloqueado": "1214489094133130"
+    }
+  }
+}
