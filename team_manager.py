@@ -1,6 +1,7 @@
 """
-Módulo para gestión de miembros del equipo desde Telegram — Bot Lubrikca v6.0
+Módulo para gestión de miembros del equipo desde Telegram — Bot Lubrikca v7.0
 Permite agregar y desactivar colaboradores sin editar el repositorio manualmente.
+Después de cada cambio en team.txt, sincroniza el estado a PostgreSQL.
 """
 
 import logging
@@ -10,9 +11,18 @@ logger    = logging.getLogger(__name__)
 TEAM_FILE = Path(__file__).parent / "team.txt"
 
 
+def _sync_to_db():
+    """Re-lee team.txt y empuja el estado actual a PostgreSQL."""
+    try:
+        from utils import _parse_team_file, save_team_data
+        save_team_data(_parse_team_file())
+    except Exception as e:
+        logger.warning(f"No se pudo sincronizar equipo a DB: {e}")
+
+
 def add_member(tg_id: int, asana_gid: str, name: str) -> bool:
     """
-    Agrega un nuevo miembro a team.txt.
+    Agrega un nuevo miembro a team.txt y sincroniza a PostgreSQL.
     Devuelve False si el tg_id ya existe (activo o inactivo).
     """
     try:
@@ -30,6 +40,7 @@ def add_member(tg_id: int, asana_gid: str, name: str) -> bool:
         with open(TEAM_FILE, "a", encoding="utf-8") as f:
             f.write(new_line)
         logger.info(f"Miembro agregado: {name} ({tg_id})")
+        _sync_to_db()
         return True
     except Exception as e:
         logger.error(f"Error agregando miembro: {e}")
@@ -38,7 +49,7 @@ def add_member(tg_id: int, asana_gid: str, name: str) -> bool:
 
 def remove_member(tg_id: int) -> str | None:
     """
-    Desactiva un miembro comentando su línea en team.txt.
+    Desactiva un miembro comentando su línea en team.txt y sincroniza a PostgreSQL.
     Devuelve el nombre si se encontró, None si no.
     """
     try:
@@ -59,6 +70,7 @@ def remove_member(tg_id: int) -> str | None:
         if removed_name:
             TEAM_FILE.write_text("\n".join(new_lines), encoding="utf-8")
             logger.info(f"Miembro desactivado: {removed_name} ({tg_id})")
+            _sync_to_db()
         return removed_name
     except Exception as e:
         logger.error(f"Error removiendo miembro: {e}")

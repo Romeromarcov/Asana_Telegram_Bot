@@ -1,5 +1,5 @@
 """
-Utilidades compartidas — Bot Lubrikca v6.0
+Utilidades compartidas — Bot Lubrikca v7.0
 
 Constantes y helpers reutilizados por bot.py, dashboard.py,
 asana_projects.py y mover_tareas.py.
@@ -17,13 +17,10 @@ ASANA_BASE = "https://app.asana.com/api/1.0"
 # Se cierra automáticamente al terminar el proceso.
 http_client = httpx.AsyncClient(timeout=15)
 
-# ── Carga del equipo ───────────────────────────────────────────────────────────
+# ── Equipo ─────────────────────────────────────────────────────────────────────
 
-def load_team() -> dict:
-    """
-    Lee team.txt y devuelve {tg_id: {"asana_gid": str, "name": str}}.
-    Líneas comentadas con # son ignoradas (miembros desactivados).
-    """
+def _parse_team_file() -> dict:
+    """Lee team.txt → {tg_id: {asana_gid, name}}. Sin fallback a DB."""
     team      = {}
     team_file = Path(__file__).parent / "team.txt"
     if not team_file.exists():
@@ -44,3 +41,27 @@ def load_team() -> dict:
         except ValueError:
             pass
     return team
+
+
+def load_team() -> dict:
+    """
+    Devuelve {tg_id: {"asana_gid": str, "name": str}}.
+    Prioridad: 1) PostgreSQL (fuente de verdad compartida entre servicios)
+               2) team.txt  (fallback dev local o primer arranque)
+    """
+    from db import db_get
+    db_data = db_get("team")
+    if db_data is not None:
+        # JSON solo guarda string keys → convertir a int
+        return {int(k): v for k, v in db_data.items()}
+    return _parse_team_file()
+
+
+def save_team_data(team: dict):
+    """
+    Persiste el equipo en PostgreSQL.
+    Llamar después de cualquier modificación a team.txt.
+    """
+    from db import db_set
+    # JSON requiere string keys
+    db_set("team", {str(k): v for k, v in team.items()})

@@ -47,7 +47,16 @@ AREA_COLORS = {
 WEEKDAY_NAMES = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
 WEEKDAY_FULL  = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 
-app = FastAPI(title="Lubrikca Dashboard", docs_url=None, redoc_url=None)
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app_):
+    """Inicializa la base de datos al arrancar el servicio Web."""
+    from db import setup_db
+    setup_db()
+    yield
+
+app = FastAPI(title="Lubrikca Dashboard", docs_url=None, redoc_url=None, lifespan=lifespan)
 
 # ── Auth básica opcional ───────────────────────────────────────────────────────
 security = HTTPBasic(auto_error=False)
@@ -63,15 +72,26 @@ def check_auth(credentials: HTTPBasicCredentials = Depends(security)):
 
 
 def load_recurring() -> list:
+    """Carga tareas recurrentes. Prioridad: PostgreSQL → archivo local."""
+    from db import db_get
+    db_data = db_get("recurring")
+    if db_data is not None:
+        return db_data
     try:
         return json.loads((BASE_DIR / "recurring.json").read_text(encoding="utf-8"))
     except Exception:
         return []
 
 def save_recurring(data: list):
-    (BASE_DIR / "recurring.json").write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    """Guarda tareas recurrentes en PostgreSQL y en archivo local."""
+    from db import db_set
+    db_set("recurring", data)
+    try:
+        (BASE_DIR / "recurring.json").write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        pass
 
 def load_saved_config() -> dict:
     if CFG_FILE.exists():

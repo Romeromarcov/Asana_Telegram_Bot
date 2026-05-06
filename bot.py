@@ -130,6 +130,11 @@ def get_members(team: dict) -> list:
 # ── TAREAS RECURRENTES — PERSISTENCIA ─────────────────────────────────────────
 
 def load_recurring() -> list:
+    """Carga tareas recurrentes. Prioridad: PostgreSQL → archivo local."""
+    from db import db_get
+    db_data = db_get("recurring")
+    if db_data is not None:
+        return db_data
     if not RECURRING_FILE.exists():
         return []
     try:
@@ -138,7 +143,10 @@ def load_recurring() -> list:
         return []
 
 def save_recurring(data: list):
+    """Guarda tareas recurrentes en archivo local y en PostgreSQL."""
     RECURRING_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    from db import db_set
+    db_set("recurring", data)
 
 def add_recurring(config: dict):
     data = load_recurring()
@@ -2680,6 +2688,10 @@ async def job_sunday_summary(context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    # Inicializar DB antes de arrancar el bot
+    from db import setup_db
+    setup_db()
+
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
     # ── ConversationHandler: manager crea tarea para un colaborador ───────────
