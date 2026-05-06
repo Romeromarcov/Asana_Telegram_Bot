@@ -38,10 +38,19 @@ logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=lo
 logger = logging.getLogger(__name__)
 
 # ── CONFIGURACIÓN ──────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
-ASANA_TOKEN     = os.environ["ASANA_TOKEN"]
-ASANA_WORKSPACE = os.environ["ASANA_WORKSPACE_ID"]
-MANAGER_CHAT_ID = int(os.environ["MANAGER_CHAT_ID"])
+def _require_env(key: str) -> str:
+    val = os.environ.get(key, "").strip()
+    if not val:
+        raise SystemExit(
+            f"\n❌ Variable de entorno requerida no encontrada: {key}\n"
+            f"   Agrégala en Railway → servicio Worker → Variables\n"
+        )
+    return val
+
+TELEGRAM_TOKEN  = _require_env("TELEGRAM_TOKEN")
+ASANA_TOKEN     = _require_env("ASANA_TOKEN")
+ASANA_WORKSPACE = _require_env("ASANA_WORKSPACE_ID")
+MANAGER_CHAT_ID = int(_require_env("MANAGER_CHAT_ID"))
 GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
 ASANA_BASE      = "https://app.asana.com/api/1.0"
 
