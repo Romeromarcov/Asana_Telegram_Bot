@@ -10,10 +10,10 @@ Flujo:
 
 import json
 import logging
+import os
 import re
 from datetime import datetime
 from pathlib import Path
-import google.generativeai as genai
 
 logger = logging.getLogger(__name__)
 MINUTAS_FILE = Path(__file__).parent / "minutas.json"
@@ -100,6 +100,26 @@ GEMINI_ERROR_MESSAGES = {
     ),
 }
 
+def _get_gemini_client():
+    """Crea un cliente Gemini usando la API key del entorno."""
+    from google import genai
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        raise GeminiError("api_error", "GEMINI_API_KEY no configurada")
+    return genai.Client(api_key=api_key)
+
+def _get_gemini_model() -> str:
+    """Devuelve el modelo activo: DB → env var → default."""
+    try:
+        from db import db_get
+        db_model = db_get("gemini_model")
+        if db_model and isinstance(db_model, str):
+            return db_model
+    except Exception:
+        pass
+    return os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
+
 async def call_gemini(
     text: str,
     image_bytes: bytes | None,
@@ -108,10 +128,11 @@ async def call_gemini(
     today_str: str,
 ) -> list[dict]:
     """
-    Llama a Gemini 1.5 Flash y devuelve la lista cruda de tareas extraídas.
+    Llama a Gemini (modelo configurable, por defecto gemini-2.5-flash).
     Lanza GeminiError con tipo específico para que el caller muestre el mensaje correcto.
     """
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    from google.genai import types
+
     prompt = build_prompt(
         text or "(extraer tareas de la imagen/documento adjunto)",
         team_names,
@@ -119,14 +140,25 @@ async def call_gemini(
     )
 
     try:
-        if image_bytes:
-            content = [prompt, {"mime_type": mime_type, "data": image_bytes}]
-        else:
-            content = prompt
+        client = _get_gemini_client()
+        model  = _get_gemini_model()
 
-        response = await model.generate_content_async(content)
+        if image_bytes:
+            contents = [
+                prompt,
+                types.Part.from_bytes(data=image_bytes, mime_type=mime_type or "image/jpeg"),
+            ]
+        else:
+            contents = prompt
+
+        response = await client.aio.models.generate_content(
+            model=model,
+            contents=contents,
+        )
         raw = response.text.strip()
 
+    except GeminiError:
+        raise
     except Exception as e:
         error_str = str(e).lower()
         if "image" in error_str or "vision" in error_str or "media" in error_str:

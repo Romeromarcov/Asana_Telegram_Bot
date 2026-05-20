@@ -257,7 +257,9 @@ def should_escalate_overdue(
 ) -> tuple[str | None, bool]:
     """
     Determina si hay que escalar al manager una tarea vencida.
-    Devuelve (alert_key, should_block).
+    Devuelve (alert_key, should_register_noncompliance).
+    A las 72h ya no se bloquea: se registra en tabla de no-cumplimiento
+    y las nuevas tareas recurrentes siguen creándose con normalidad.
     Pasa `state` para evitar lectura de disco por cada tarea.
     """
     hours = hours_since_due(due_on, tz)
@@ -265,7 +267,7 @@ def should_escalate_overdue(
         return None, False
 
     escalation_steps = [
-        # key           min_h  max_h  session  block
+        # key           min_h  max_h  session  register_noncompliance
         ("overdue_pm",  0,     24,    "pm",    False),
         ("overdue_am",  0,     48,    "am",    False),
         ("24h",         24,    48,    None,    False),
@@ -273,13 +275,79 @@ def should_escalate_overdue(
         ("72h",         72,    9999,  None,    True ),
     ]
 
-    for key, min_h, max_h, req_session, should_block in escalation_steps:
+    for key, min_h, max_h, req_session, register_nc in escalation_steps:
         if min_h <= hours < max_h:
             if req_session and req_session != session:
                 continue
             if not was_alert_sent(task_gid, key, state=state):
-                return key, should_block
+                return key, register_nc
     return None, False
+
+
+# ── TABLA DE NO-CUMPLIMIENTO ───────────────────────────────────────────────────
+
+def load_noncompliant() -> list:
+    """Carga el registro de tareas no cumplidas (>72h vencidas)."""
+    try:
+        from db import db_get
+        data = db_get("noncompliant")
+        if data is not None:
+            return data
+    except Exception:
+        pass
+    nc_file = Path(__file__).parent / "noncompliant.json"
+    if nc_file.exists():
+        try:
+            return json.loads(nc_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return []
+
+
+def save_noncompliant(records: list):
+    """Guarda el registro de tareas no cumplidas en DB y archivo."""
+    try:
+        from db import db_set
+        db_set("noncompliant", records)
+    except Exception:
+        pass
+    nc_file = Path(__file__).parent / "noncompliant.json"
+    try:
+        nc_file.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def register_noncompliance(
+    task_gid: str,
+    task_name: str,
+    assignee_name: str,
+    assignee_tg_id: int,
+    due_on: str,
+    hours_overdue: float,
+    recurring_name: str | None = None,
+):
+    """
+    Registra una tarea como no cumplida (>72h vencida sin completar).
+    No bloquea las nuevas tareas recurrentes.
+    """
+    records = load_noncompliant()
+    # Evitar duplicados
+    if any(r.get("task_gid") == task_gid for r in records):
+        return
+
+    records.append({
+        "task_gid":       task_gid,
+        "task_name":      task_name,
+        "assignee_name":  assignee_name,
+        "assignee_tg_id": assignee_tg_id,
+        "due_on":         due_on,
+        "hours_overdue":  round(hours_overdue, 1),
+        "recurring_name": recurring_name,
+        "registered_at":  datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    })
+    save_noncompliant(records)
+    logger.info(f"⛔ No-cumplimiento registrado: {task_name} ({assignee_name})")
 
 # ── ETIQUETAS PARA MENSAJES ────────────────────────────────────────────────────
 

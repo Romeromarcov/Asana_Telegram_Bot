@@ -313,6 +313,116 @@ async def reset_config(_=Depends(check_auth)):
     """No-op en arquitectura de dos servicios; la config viene de env vars."""
     return {"ok": True, "message": "La configuración se gestiona via variables de entorno."}
 
+# ── Recurring: editar ──────────────────────────────────────────────────────────
+@app.put("/api/recurring/{idx}")
+async def edit_recurring(idx: int, request: Request, _=Depends(check_auth)):
+    body = await request.json()
+    data = load_recurring()
+    if idx < 0 or idx >= len(data):
+        raise HTTPException(404, "No encontrado")
+    r = data[idx]
+    if "task_name" in body and body["task_name"].strip():
+        r["task_name"] = body["task_name"].strip()
+    if "weekday" in body:
+        r["weekday"] = int(body["weekday"])
+    if "freq" in body:
+        r["freq"] = body["freq"]
+    if "hours" in body:
+        r["hours"] = [int(h) for h in body["hours"]]
+        r["times_per_day"] = len(r["hours"])
+    if "assignee_tg_id" in body:
+        team = load_team()
+        tg_id = int(body["assignee_tg_id"])
+        if tg_id in team:
+            r["assignee_tg_id"] = tg_id
+            r["assignee_name"]  = team[tg_id]["name"]
+            r["assignee_gid"]   = team[tg_id]["asana_gid"]
+    data[idx] = r
+    save_recurring(data)
+    return {"ok": True, "updated": r["task_name"]}
+
+# ── Recurring: reiniciar contador pendientes ───────────────────────────────────
+@app.post("/api/recurring/{idx}/reset")
+async def reset_recurring_count(idx: int, _=Depends(check_auth)):
+    data = load_recurring()
+    if idx < 0 or idx >= len(data):
+        raise HTTPException(404)
+    data[idx]["pending_count"] = 0
+    save_recurring(data)
+    return {"ok": True}
+
+# ── Tareas: marcar completada en Asana ────────────────────────────────────────
+@app.post("/api/tasks/{task_gid}/complete")
+async def complete_task_endpoint(task_gid: str, _=Depends(check_auth)):
+    if not ASANA_TOKEN:
+        raise HTTPException(503, "ASANA_TOKEN no configurado")
+    try:
+        r = await http_client.put(
+            f"{ASANA_BASE}/tasks/{task_gid}",
+            headers={"Authorization": f"Bearer {ASANA_TOKEN}", "Content-Type": "application/json"},
+            json={"data": {"completed": True}},
+        )
+        r.raise_for_status()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+# ── Equipo: agregar miembro ────────────────────────────────────────────────────
+@app.post("/api/team/add")
+async def add_team_member(request: Request, _=Depends(check_auth)):
+    body = await request.json()
+    tg_id     = body.get("tg_id")
+    asana_gid = body.get("asana_gid", "").strip()
+    name      = body.get("name", "").strip()
+    if not tg_id or not asana_gid or not name:
+        raise HTTPException(400, "tg_id, asana_gid y name son obligatorios")
+    from team_manager import add_member
+    ok = add_member(int(tg_id), asana_gid, name)
+    if not ok:
+        raise HTTPException(409, "El miembro ya existe")
+    return {"ok": True, "added": name}
+
+# ── Tareas no cumplidas ────────────────────────────────────────────────────────
+@app.get("/api/noncompliant")
+async def api_noncompliant(_=Depends(check_auth)):
+    from escalation import load_noncompliant
+    records = load_noncompliant()
+    return sorted(records, key=lambda r: r.get("registered_at", ""), reverse=True)
+
+@app.delete("/api/noncompliant/{task_gid}")
+async def delete_noncompliant(task_gid: str, _=Depends(check_auth)):
+    from escalation import load_noncompliant, save_noncompliant
+    records = [r for r in load_noncompliant() if r.get("task_gid") != task_gid]
+    save_noncompliant(records)
+    return {"ok": True}
+
+# ── Modelo Gemini ──────────────────────────────────────────────────────────────
+@app.get("/api/gemini")
+async def api_gemini(_=Depends(check_auth)):
+    from db import db_get
+    active = db_get("gemini_model") or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+    has_key = bool(os.environ.get("GEMINI_API_KEY"))
+    return {
+        "active_model": active,
+        "has_api_key":  has_key,
+        "available_models": [
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+            "gemini-2.0-flash",
+            "gemini-1.5-flash",
+        ],
+    }
+
+@app.post("/api/gemini")
+async def save_gemini_model(request: Request, _=Depends(check_auth)):
+    body  = await request.json()
+    model = body.get("model", "").strip()
+    if not model:
+        raise HTTPException(400, "model requerido")
+    from db import db_set
+    db_set("gemini_model", model)
+    return {"ok": True, "model": model}
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}

@@ -32,8 +32,6 @@ from minuta import (
     tasks_need_fixing, next_incomplete_idx,
     GeminiError, build_minuta_record, save_minuta,
 )
-import google.generativeai as genai
-
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -51,7 +49,8 @@ TELEGRAM_TOKEN  = _require_env("TELEGRAM_TOKEN")
 ASANA_TOKEN     = _require_env("ASANA_TOKEN")
 ASANA_WORKSPACE = _require_env("ASANA_WORKSPACE_ID")
 MANAGER_CHAT_ID = int(_require_env("MANAGER_CHAT_ID"))
-GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+# Nota: el cliente Gemini se crea en minuta.py con google-genai SDK (gemini-2.5-flash)
 
 # Archivos de datos
 RECURRING_FILE   = Path(__file__).parent / "recurring.json"
@@ -71,9 +70,6 @@ REPORT_MIN             = int(os.environ.get("REPORT_MIN",          "0"))
 CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "5"))
 
 TZ = pytz.timezone(TIMEZONE)
-
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
 
 # ── Persistencia de known_tasks (evita re-notificar al reiniciar) ─────────────
 def load_known_tasks() -> dict[str, set]:
@@ -2489,10 +2485,10 @@ async def mover_ejecutar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 from escalation import (
     should_remind_before_due, should_escalate_overdue,
-    mark_alert_sent, is_task_blocked, block_task, cleanup_alert_state,
+    mark_alert_sent, is_task_blocked, cleanup_alert_state,
     load_alert_state, save_alert_state,
     get_freq_for_task, days_until_due, hours_since_due,
-    register_unique_task, DAYS_LABEL,
+    register_unique_task, register_noncompliance, DAYS_LABEL,
 )
 
 async def job_escalation(context: ContextTypes.DEFAULT_TYPE, session: str = "pm"):
@@ -2544,10 +2540,7 @@ async def job_escalation(context: ContextTypes.DEFAULT_TYPE, session: str = "pm"
                 except Exception as e:
                     logger.error(f"Error alerta anticipada: {e}")
 
-            if is_task_blocked(gid, state=alert_state):   # sin I/O
-                continue
-
-            esc_key, should_block = should_escalate_overdue(
+            esc_key, register_nc = should_escalate_overdue(
                 gid, due_on, session, TZ, state=alert_state)   # sin I/O
             if not esc_key:
                 continue
@@ -2565,7 +2558,7 @@ async def job_escalation(context: ContextTypes.DEFAULT_TYPE, session: str = "pm"
                 level = "URGENTE — Vencida +48h"
             else:
                 icon  = "⛔"
-                level = "CRÍTICO — Bloqueada +72h"
+                level = "CRÍTICO — Vencida +72h — registrada como no cumplida"
 
             hours_int = int(hours)
             time_str  = f"{hours_int}h" if hours_int > 0 else "recién vencida"
@@ -2576,8 +2569,11 @@ async def job_escalation(context: ContextTypes.DEFAULT_TYPE, session: str = "pm"
                 f"👤 {info['name']}\n"
                 f"📅 Venció: {due_on} (hace {time_str})\n"
             )
-            if should_block:
-                esc_msg += "\n⛔ *Tarea bloqueada.* No se crearán nuevas recurrencias hasta que se complete."
+            if register_nc:
+                esc_msg += (
+                    "\n⛔ *Registrada como no cumplida.*\n"
+                    "Las nuevas tareas recurrentes continúan creándose normalmente."
+                )
 
             keyboard_mgr = InlineKeyboardMarkup([[
                 InlineKeyboardButton(f"📋 Ver tareas de {get_first_name(info['name'])}",
@@ -2588,8 +2584,19 @@ async def job_escalation(context: ContextTypes.DEFAULT_TYPE, session: str = "pm"
                     chat_id=MANAGER_CHAT_ID, text=esc_msg,
                     reply_markup=keyboard_mgr, parse_mode="Markdown")
                 mark_alert_sent(gid, esc_key, state=alert_state)   # sin I/O
-                if should_block:
-                    block_task(gid, state=alert_state)              # sin I/O
+                if register_nc:
+                    # Registrar en tabla de no-cumplimiento (no bloquea la recurrencia)
+                    rec_data_local = load_recurring()
+                    rec_name = get_freq_for_task(gid, rec_data_local)
+                    register_noncompliance(
+                        task_gid=gid,
+                        task_name=task["name"],
+                        assignee_name=info["name"],
+                        assignee_tg_id=tg_id,
+                        due_on=due_on,
+                        hours_overdue=hours,
+                        recurring_name=rec_name,
+                    )
                 logger.info(f"Escalación '{esc_key}' → manager: {info['name']} / {task['name']}")
             except Exception as e:
                 logger.error(f"Error escalación: {e}")
