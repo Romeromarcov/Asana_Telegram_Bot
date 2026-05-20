@@ -120,7 +120,7 @@ async def asana_get_tasks(asana_gid: str) -> list:
     params  = {
         "assignee": asana_gid, "workspace": ASANA_WORKSPACE,
         "completed_since": "now",
-        "opt_fields": "name,due_on,permalink_url",
+        "opt_fields": "gid,name,due_on,permalink_url",
         "limit": 50,
     }
     try:
@@ -447,6 +447,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
      background:var(--bg);color:var(--text);font-size:14px}
+.btn-success{border-color:#6EE7B7;color:#065F46;background:#D1FAE5}
+.btn-success:hover{background:#A7F3D0}
+.btn-warning{border-color:#FDE68A;color:#92400E;background:#FFFBEB}
+.btn-warning:hover{background:#FEF3C7}
 /* Layout */
 .app{display:flex;min-height:100vh}
 .sidebar{width:220px;background:var(--surface);border-right:1px solid var(--border);
@@ -593,6 +597,8 @@ select.form-input{cursor:pointer}
     <div class="nav-item" onclick="tab('checklist',this)"><span class="nav-icon">✅</span>Checklist</div>
     <div class="nav-item" onclick="tab('recurrentes',this)"><span class="nav-icon">🔁</span>Recurrentes</div>
     <div class="nav-item" onclick="tab('equipo',this)"><span class="nav-icon">👥</span>Equipo</div>
+    <div class="nav-item" onclick="tab('no-cumplidas',this)"><span class="nav-icon">📋</span>No Cumplidas</div>
+    <div class="nav-item" onclick="tab('api-ia',this)"><span class="nav-icon">🤖</span>API / IA</div>
     <div class="nav-item" onclick="tab('config',this)"><span class="nav-icon">⚙️</span>Configuración</div>
   </nav>
 </aside>
@@ -636,10 +642,32 @@ select.form-input{cursor:pointer}
 <div id="tab-equipo" class="tab-content">
   <div class="page-header">
     <div><div class="page-title">Equipo</div>
-    <div class="page-sub">Para agregar miembros usa ➕ en el menú de Telegram.</div></div>
-    <button class="btn" onclick="loadTeam()">↻ Actualizar</button>
+    <div class="page-sub">Gestiona los miembros del equipo.</div></div>
+    <div class="btn-group">
+      <button class="btn" onclick="loadTeam()">↻ Actualizar</button>
+      <button class="btn btn-primary" onclick="openAddMemberModal()">+ Agregar miembro</button>
+    </div>
   </div>
   <div id="team-body" class="team-grid"><div class="loader"><span class="spin">⟳</span></div></div>
+</div>
+
+<!-- ═══ NO CUMPLIDAS ═══ -->
+<div id="tab-no-cumplidas" class="tab-content">
+  <div class="page-header">
+    <div><div class="page-title">Tareas No Cumplidas</div>
+    <div class="page-sub">Tareas vencidas más de 72 h sin completar.</div></div>
+    <button class="btn" onclick="loadNoncompliant()">↻ Actualizar</button>
+  </div>
+  <div id="nc-body"><div class="loader"><span class="spin">⟳</span></div></div>
+</div>
+
+<!-- ═══ API / IA ═══ -->
+<div id="tab-api-ia" class="tab-content">
+  <div class="page-header">
+    <div><div class="page-title">API / Inteligencia Artificial</div>
+    <div class="page-sub">Configura el modelo Gemini para procesamiento de minutas.</div></div>
+  </div>
+  <div id="ai-body"><div class="loader"><span class="spin">⟳</span></div></div>
 </div>
 
 <!-- ═══ CONFIGURACIÓN ═══ -->
@@ -721,6 +749,76 @@ select.form-input{cursor:pointer}
   </div>
 </div>
 
+<!-- ═══ MODAL: Editar recurrente ═══ -->
+<div class="modal-overlay" id="edit-rec-modal">
+  <div class="modal">
+    <div class="modal-title">✏️ Editar tarea recurrente</div>
+    <div class="modal-body">
+      <input type="hidden" id="edit-rec-idx">
+      <div>
+        <label class="form-label">Nombre de la tarea</label>
+        <input class="form-input" id="edit-rec-name" placeholder="Nombre de la tarea">
+      </div>
+      <div>
+        <label class="form-label">Responsable</label>
+        <select class="form-input" id="edit-rec-assignee"></select>
+      </div>
+      <div>
+        <label class="form-label">Frecuencia</label>
+        <select class="form-input" id="edit-rec-freq" onchange="updateEditFreqFields()">
+          <option value="weekly">Semanal</option>
+          <option value="intraday">Diaria</option>
+        </select>
+      </div>
+      <div id="edit-rec-weekly-field">
+        <label class="form-label">Día de la semana</label>
+        <select class="form-input" id="edit-rec-weekday">
+          <option value="0">Lunes</option><option value="1">Martes</option>
+          <option value="2">Miércoles</option><option value="3">Jueves</option>
+          <option value="4">Viernes</option>
+        </select>
+      </div>
+      <div id="edit-rec-daily-field" style="display:none">
+        <label class="form-label">Hora de recordatorio</label>
+        <input class="form-input" id="edit-rec-hour" type="number" min="0" max="23" value="9" placeholder="9">
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal('edit-rec-modal')">Cancelar</button>
+      <button class="btn btn-primary" onclick="submitEditRec()">Guardar cambios</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ MODAL: Agregar miembro ═══ -->
+<div class="modal-overlay" id="add-member-modal">
+  <div class="modal">
+    <div class="modal-title">👤 Agregar miembro al equipo</div>
+    <div class="modal-body">
+      <div>
+        <label class="form-label">Telegram ID</label>
+        <input class="form-input" id="mem-tg-id" type="number" placeholder="123456789">
+      </div>
+      <div>
+        <label class="form-label">Asana GID</label>
+        <input class="form-input" id="mem-asana-gid" placeholder="1234567890123456">
+      </div>
+      <div>
+        <label class="form-label">Nombre completo (con área)</label>
+        <input class="form-input" id="mem-name" placeholder="Ej: Juan Pérez (Ventas)">
+      </div>
+      <div class="info-box">
+        <span>ℹ️</span>
+        <div>El Asana GID se encuentra en la URL del perfil del usuario en Asana.</div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal('add-member-modal')">Cancelar</button>
+      <button class="btn btn-primary" onclick="submitAddMember()">Agregar</button>
+    </div>
+  </div>
+</div>
+
 <!-- Toast -->
 <div id="toast"></div>
 
@@ -743,7 +841,9 @@ function tab(name, el) {
   el.classList.add('active');
   const loaders = {
     dashboard:'loadDashboard', checklist:'loadChecklist',
-    recurrentes:'loadRecurrentes', equipo:'loadTeam', config:'loadConfig'
+    recurrentes:'loadRecurrentes', equipo:'loadTeam',
+    'no-cumplidas':'loadNoncompliant', 'api-ia':'loadGemini',
+    config:'loadConfig'
   };
   window[loaders[name]]?.();
 }
@@ -792,10 +892,11 @@ async function loadDashboard() {
       const area = (p.name.match(/\((.+)\)/) || ['',''])[1];
       const rows = p.tasks.map(t => {
         const od = t.due_on && t.due_on < TODAY;
-        return `<div class="task-row">
+        return `<div class="task-row" id="tr-${t.gid}">
           <span class="task-name">${t.name}</span>
           <span class="task-due${od?' overdue':''}">${fmt(t.due_on)}</span>
           ${t.permalink_url?`<a class="task-link" href="${t.permalink_url}" target="_blank">↗</a>`:''}
+          <button class="btn btn-sm btn-success" onclick="completarTarea('${t.gid}',this)" title="Marcar completada">✓</button>
         </div>`;
       }).join('');
       return `<div class="person-block">
@@ -847,9 +948,11 @@ async function loadChecklist() {
 
 /* ══════════ RECURRENTES (gestión) ══════════ */
 async function loadRecurrentes() {
+  _editRecCache = [];
   document.getElementById('rec-body').innerHTML = '<div class="loader"><span class="spin">⟳</span></div>';
   try {
     const data = await api('GET','/api/recurring');
+    _editRecCache = data;
     if (!data.length) { document.getElementById('rec-body').innerHTML='<p class="empty-msg">No hay tareas recurrentes.</p>'; return; }
     const rows = data.map(r => {
       const pauseLabel = r.paused ? '▶ Reanudar' : '⏸ Pausar';
@@ -866,8 +969,10 @@ async function loadRecurrentes() {
           : `<span class="status-chip ${r.pending_count>1?'s-pending':'s-ok'}">${r.pending_count} pendiente${r.pending_count!==1?'s':''}</span>`
         }</td>
         <td><div class="rec-actions">
+          <button class="btn btn-sm" onclick="openEditRecModal(${r.idx})" title="Editar">✏️</button>
+          <button class="btn btn-sm btn-warning" onclick="resetCount(${r.idx},'${r.task_name.replace(/'/g,"\\'")}',this)" title="Reiniciar contador">↺</button>
           <button class="btn btn-sm" onclick="toggleRec(${r.idx},'${r.task_name.replace(/'/g,"\\'")}',this)">${pauseLabel}</button>
-          <button class="btn btn-sm btn-danger" onclick="confirmDelRec(${r.idx},'${r.task_name.replace(/'/g,"\\'")}')">✕ Eliminar</button>
+          <button class="btn btn-sm btn-danger" onclick="confirmDelRec(${r.idx},'${r.task_name.replace(/'/g,"\\'")}')">✕</button>
         </div></td>
       </tr>`;
     }).join('');
@@ -935,6 +1040,96 @@ async function submitAddRec() {
   } catch(e) { toast('Error: ' + e.message, false); }
 }
 
+/* ── Completar tarea desde dashboard ── */
+async function completarTarea(gid, btn) {
+  btn.disabled = true; btn.textContent = '...';
+  try {
+    await api('POST', `/api/tasks/${gid}/complete`);
+    const row = document.getElementById('tr-' + gid);
+    if (row) { row.style.opacity='.4'; row.style.textDecoration='line-through'; }
+    toast('✅ Tarea marcada como completada');
+  } catch(e) {
+    toast('Error: ' + e.message, false);
+    btn.disabled = false; btn.textContent = '✓';
+  }
+}
+
+/* ── Reiniciar contador de recurrente ── */
+async function resetCount(idx, name, btn) {
+  btn.disabled = true;
+  try {
+    await api('POST', `/api/recurring/${idx}/reset`);
+    toast(`↺ Contador de "${name}" reiniciado`);
+    loadRecurrentes();
+  } catch(e) {
+    toast('Error: ' + e.message, false);
+    btn.disabled = false;
+  }
+}
+
+/* ── Edit recurring modal ── */
+let _editRecCache = [];
+async function openEditRecModal(idx) {
+  // Reuse cached data or reload
+  let data = _editRecCache;
+  if (!data.length) {
+    try { data = await api('GET','/api/recurring'); _editRecCache = data; } catch(e) { toast('Error: '+e.message,false); return; }
+  }
+  const r = data.find(x => x.idx === idx);
+  if (!r) return;
+
+  document.getElementById('edit-rec-idx').value   = idx;
+  document.getElementById('edit-rec-name').value  = r.task_name;
+
+  // Populate assignee select
+  const sel = document.getElementById('edit-rec-assignee');
+  sel.innerHTML = teamCache.map(m =>
+    `<option value="${m.tg_id}">${m.name.split('(')[0].trim()} — ${(m.name.match(/\((.+)\)/)||['',''])[1]}</option>`
+  ).join('');
+
+  // Detect freq from freq_label (intraday vs weekly)
+  const isIntraday = r.freq_label && r.freq_label.startsWith('Diario');
+  document.getElementById('edit-rec-freq').value = isIntraday ? 'intraday' : 'weekly';
+  updateEditFreqFields();
+
+  if (!isIntraday) {
+    // Find weekday index from day_label
+    const days = ['Lun','Mar','Mié','Jue','Vie','Sáb','Dom'];
+    const wd = days.indexOf(r.day_label);
+    document.getElementById('edit-rec-weekday').value = wd >= 0 ? wd : 0;
+  } else {
+    // Extract hour from freq_label like "Diario (9:00, 15:00)"
+    const m = r.freq_label.match(/(\d+):/);
+    document.getElementById('edit-rec-hour').value = m ? m[1] : '9';
+  }
+
+  document.getElementById('edit-rec-modal').classList.add('open');
+}
+
+function updateEditFreqFields() {
+  const freq = document.getElementById('edit-rec-freq').value;
+  document.getElementById('edit-rec-weekly-field').style.display = freq==='weekly'   ? '' : 'none';
+  document.getElementById('edit-rec-daily-field').style.display  = freq==='intraday' ? '' : 'none';
+}
+
+async function submitEditRec() {
+  const idx  = parseInt(document.getElementById('edit-rec-idx').value);
+  const name = document.getElementById('edit-rec-name').value.trim();
+  const tg_id = document.getElementById('edit-rec-assignee').value;
+  const freq  = document.getElementById('edit-rec-freq').value;
+  if (!name) { toast('El nombre no puede estar vacío', false); return; }
+  const body = { task_name: name, assignee_tg_id: parseInt(tg_id), freq };
+  if (freq === 'weekly')   body.weekday = parseInt(document.getElementById('edit-rec-weekday').value);
+  if (freq === 'intraday') body.hours   = [parseInt(document.getElementById('edit-rec-hour').value) || 9];
+  try {
+    await api('PUT', `/api/recurring/${idx}`, body);
+    toast('✅ Tarea recurrente actualizada');
+    closeModal('edit-rec-modal');
+    _editRecCache = [];
+    loadRecurrentes(); loadChecklist();
+  } catch(e) { toast('Error: ' + e.message, false); }
+}
+
 /* ══════════ EQUIPO ══════════ */
 async function loadTeam() {
   document.getElementById('team-body').innerHTML = '<div class="loader"><span class="spin">⟳</span></div>';
@@ -969,6 +1164,111 @@ async function removeMember(tg_id, name, btn) {
     toast(`👤 ${name.split('(')[0].trim()} desactivado`);
     loadTeam();
   } catch(e) { toast('Error: ' + e.message, false); btn.disabled=false; btn.textContent='Desactivar'; }
+}
+
+/* ── Agregar miembro ── */
+function openAddMemberModal() {
+  document.getElementById('mem-tg-id').value     = '';
+  document.getElementById('mem-asana-gid').value = '';
+  document.getElementById('mem-name').value      = '';
+  document.getElementById('add-member-modal').classList.add('open');
+}
+
+async function submitAddMember() {
+  const tg_id     = parseInt(document.getElementById('mem-tg-id').value);
+  const asana_gid = document.getElementById('mem-asana-gid').value.trim();
+  const name      = document.getElementById('mem-name').value.trim();
+  if (!tg_id || !asana_gid || !name) { toast('Todos los campos son obligatorios', false); return; }
+  try {
+    await api('POST', '/api/team/add', { tg_id, asana_gid, name });
+    toast(`✅ ${name.split('(')[0].trim()} agregado al equipo`);
+    closeModal('add-member-modal');
+    loadTeam();
+  } catch(e) { toast('Error: ' + e.message, false); }
+}
+
+/* ══════════ NO CUMPLIDAS ══════════ */
+async function loadNoncompliant() {
+  document.getElementById('nc-body').innerHTML = '<div class="loader"><span class="spin">⟳</span></div>';
+  try {
+    const data = await api('GET', '/api/noncompliant');
+    if (!data.length) {
+      document.getElementById('nc-body').innerHTML = '<p class="empty-msg">✅ Sin tareas no cumplidas registradas.</p>';
+      return;
+    }
+    const rows = data.map(r => {
+      const hoursLabel = r.hours_overdue >= 24
+        ? `${Math.floor(r.hours_overdue/24)}d ${Math.round(r.hours_overdue%24)}h`
+        : `${Math.round(r.hours_overdue)}h`;
+      const rec = r.recurring_name ? `<div style="font-size:11px;color:var(--text2)">${r.recurring_name}</div>` : '';
+      return `<tr>
+        <td><div style="font-weight:500">${r.task_name}</div>${rec}</td>
+        <td>${r.assignee_name.split('(')[0].trim()}</td>
+        <td>${fmt(r.due_on)}</td>
+        <td><span class="status-chip s-pending">⚠ ${hoursLabel} retraso</span></td>
+        <td style="font-size:11px;color:var(--text3)">${r.registered_at ? r.registered_at.slice(0,16).replace('T',' ') : '—'}</td>
+        <td><button class="btn btn-sm btn-danger" onclick="deleteNoncompliant('${r.task_gid}',this)">✕</button></td>
+      </tr>`;
+    }).join('');
+    document.getElementById('nc-body').innerHTML = `
+      <div class="table-wrap"><table>
+        <thead><tr><th>Tarea</th><th>Responsable</th><th>Fecha límite</th><th>Retraso</th><th>Registrada</th><th></th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>`;
+  } catch(e) { document.getElementById('nc-body').innerHTML = `<p style="color:#B91C1C">Error: ${e.message}</p>`; }
+}
+
+async function deleteNoncompliant(task_gid, btn) {
+  if (!confirm('¿Eliminar este registro de no-cumplimiento?')) return;
+  btn.disabled = true;
+  try {
+    await api('DELETE', `/api/noncompliant/${task_gid}`);
+    toast('Registro eliminado');
+    loadNoncompliant();
+  } catch(e) { toast('Error: ' + e.message, false); btn.disabled = false; }
+}
+
+/* ══════════ API / IA ══════════ */
+async function loadGemini() {
+  document.getElementById('ai-body').innerHTML = '<div class="loader"><span class="spin">⟳</span></div>';
+  try {
+    const d = await api('GET', '/api/gemini');
+    const keyStatus = d.has_api_key
+      ? '<span class="status-chip s-ok">✅ Configurada en Railway</span>'
+      : '<span class="status-chip s-missing">❌ No configurada (GEMINI_API_KEY en Railway)</span>';
+    const opts = d.available_models.map(m =>
+      `<option value="${m}" ${m===d.active_model?'selected':''}>${m}</option>`
+    ).join('');
+    document.getElementById('ai-body').innerHTML = `
+      <div class="config-grid">
+        <div class="config-card" style="grid-column:span 2">
+          <label class="form-label">Estado API Key</label>
+          <div style="margin-top:6px">${keyStatus}</div>
+          <div style="font-size:12px;color:var(--text2);margin-top:10px">
+            La API key se configura como variable de entorno <code>GEMINI_API_KEY</code> en Railway.
+          </div>
+        </div>
+        <div class="config-card" style="grid-column:span 2">
+          <label class="form-label" for="gemini-model">Modelo activo</label>
+          <select class="form-input" id="gemini-model" style="margin-top:6px">${opts}</select>
+          <div style="font-size:11px;color:var(--text3);margin-top:6px">
+            Modelo actual: <strong>${d.active_model}</strong>
+          </div>
+          <div style="margin-top:14px">
+            <button class="btn btn-primary" onclick="saveGemini()">💾 Guardar modelo</button>
+          </div>
+        </div>
+      </div>`;
+  } catch(e) { document.getElementById('ai-body').innerHTML = `<p style="color:#B91C1C">Error: ${e.message}</p>`; }
+}
+
+async function saveGemini() {
+  const model = document.getElementById('gemini-model').value;
+  try {
+    await api('POST', '/api/gemini', { model });
+    toast(`✅ Modelo "${model}" guardado`);
+    loadGemini();
+  } catch(e) { toast('Error: ' + e.message, false); }
 }
 
 /* ══════════ CONFIGURACIÓN ══════════ */

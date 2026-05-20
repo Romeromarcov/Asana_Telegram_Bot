@@ -8,6 +8,7 @@ Flujo:
   → historial guardado en minutas.json
 """
 
+import base64
 import json
 import logging
 import os
@@ -62,6 +63,8 @@ def build_prompt(text: str, team_names: list[str], today_str: str) -> str:
         f"MINUTA:\n{text}"
     )
 
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+
 # ── LLAMADA A GEMINI ──────────────────────────────────────────────────────────
 
 # Mensajes de error claros según el tipo de fallo
@@ -100,13 +103,12 @@ GEMINI_ERROR_MESSAGES = {
     ),
 }
 
-def _get_gemini_client():
-    """Crea un cliente Gemini usando la API key del entorno."""
-    from google import genai
+def _get_gemini_api_key() -> str:
+    """Obtiene la API key de Gemini del entorno."""
     api_key = os.environ.get("GEMINI_API_KEY", "")
     if not api_key:
         raise GeminiError("api_error", "GEMINI_API_KEY no configurada")
-    return genai.Client(api_key=api_key)
+    return api_key
 
 def _get_gemini_model() -> str:
     """Devuelve el modelo activo: DB → env var → default."""
@@ -128,34 +130,48 @@ async def call_gemini(
     today_str: str,
 ) -> list[dict]:
     """
-    Llama a Gemini (modelo configurable, por defecto gemini-2.5-flash).
+    Llama a Gemini vía REST API directa (sin SDK — evita conflictos de httpx).
+    Modelo configurable, por defecto gemini-2.5-flash.
     Lanza GeminiError con tipo específico para que el caller muestre el mensaje correcto.
     """
-    from google.genai import types
+    from utils import http_client
 
-    prompt = build_prompt(
+    api_key = _get_gemini_api_key()
+    model   = _get_gemini_model()
+    prompt  = build_prompt(
         text or "(extraer tareas de la imagen/documento adjunto)",
         team_names,
         today_str,
     )
 
+    # Construir partes del mensaje
+    parts: list[dict] = [{"text": prompt}]
+    if image_bytes:
+        b64 = base64.b64encode(image_bytes).decode("ascii")
+        parts.append({
+            "inlineData": {
+                "mimeType": mime_type or "image/jpeg",
+                "data":     b64,
+            }
+        })
+
+    url  = f"{GEMINI_API_BASE}/{model}:generateContent"
+    body = {"contents": [{"parts": parts}]}
+
     try:
-        client = _get_gemini_client()
-        model  = _get_gemini_model()
-
-        if image_bytes:
-            contents = [
-                prompt,
-                types.Part.from_bytes(data=image_bytes, mime_type=mime_type or "image/jpeg"),
-            ]
-        else:
-            contents = prompt
-
-        response = await client.aio.models.generate_content(
-            model=model,
-            contents=contents,
+        r = await http_client.post(
+            url,
+            params={"key": api_key},
+            json=body,
+            timeout=60,
         )
-        raw = response.text.strip()
+        r.raise_for_status()
+        data = r.json()
+        # Extraer texto de la respuesta
+        candidates = data.get("candidates", [])
+        if not candidates:
+            raise GeminiError("api_error", f"No candidates in response: {data}")
+        raw = candidates[0]["content"]["parts"][0]["text"].strip()
 
     except GeminiError:
         raise
