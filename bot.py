@@ -123,7 +123,9 @@ known_tasks: dict[str, set] = load_known_tasks()
     SELF_TASK_NOTES,
     # Área de trabajo (selección)
     AREA_TASK_AREA,
-) = range(21)
+    # Solicitud de delegación al manager (líder)
+    LEADER_REQ_TASK,
+) = range(22)
 
 def get_members(team: dict) -> list:
     """Devuelve miembros del equipo sin el manager."""
@@ -259,15 +261,19 @@ def freq_label(config: dict) -> str:
 
 # ── MENÚ PRINCIPAL ─────────────────────────────────────────────────────────────
 
-def main_menu_keyboard(is_manager: bool = False) -> InlineKeyboardMarkup:
+def main_menu_keyboard(is_manager: bool = False, leader_slugs: list = None) -> InlineKeyboardMarkup:
+    from teams_manager import get_permissions
+    perms = get_permissions()
     buttons = [
         [InlineKeyboardButton("📋 Ver mis tareas",       callback_data="ver_tareas")],
         [InlineKeyboardButton("✅ Completar una tarea",  callback_data="completar_menu")],
         [InlineKeyboardButton("✅✅ Completar todas",    callback_data="completar_todas_confirm")],
         [InlineKeyboardButton("🔀 Mover tarea",          callback_data="mover_start")],
         [InlineKeyboardButton("🔄 Actualizar estado",    callback_data="status_menu")],
-        [InlineKeyboardButton("📝 Crear mi tarea",       callback_data="self_task_start")],
     ]
+    # Crear tarea propia (si el permiso lo permite)
+    if is_manager or perms.get("members_can_create_own_tasks", True):
+        buttons.append([InlineKeyboardButton("📝 Crear mi tarea", callback_data="self_task_start")])
     if is_manager:
         buttons.append([InlineKeyboardButton("➕ Crear tarea para alguien", callback_data="crear_tarea_start")])
         buttons.append([InlineKeyboardButton("📄 Cargar minuta",            callback_data="minuta_start")])
@@ -275,9 +281,18 @@ def main_menu_keyboard(is_manager: bool = False) -> InlineKeyboardMarkup:
         buttons.append([InlineKeyboardButton("📊 Reporte del equipo",       callback_data="reporte")])
         buttons.append([InlineKeyboardButton("👥 Equipo",                   callback_data="equipo")])
         buttons.append([InlineKeyboardButton("➕ Agregar miembro",          callback_data="team_add_start")])
+    elif leader_slugs:
+        # Opciones exclusivas para líderes de área
+        if perms.get("leader_can_create_tasks", True):
+            buttons.append([InlineKeyboardButton("➕ Crear tarea para mi equipo", callback_data="leader_create_task")])
+        if perms.get("leader_can_request_delegation", True):
+            buttons.append([InlineKeyboardButton("📤 Solicitar tarea al manager",  callback_data="leader_req_task_start")])
+        if perms.get("leader_receives_reports", True):
+            buttons.append([InlineKeyboardButton("📊 Reporte de mi área",          callback_data="leader_area_report")])
     return InlineKeyboardMarkup(buttons)
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None):
+    from teams_manager import get_areas_for_member
     tg_id = update.effective_user.id
     team  = load_team()
     is_manager = (tg_id == MANAGER_CHAT_ID)
@@ -290,9 +305,17 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
             await update.message.reply_text(msg, parse_mode="Markdown")
         return
 
+    # Detectar si es líder de algún área
+    leader_slugs = None
+    if not is_manager:
+        areas = get_areas_for_member(tg_id)
+        slugs = [a["slug"] for a in areas if a.get("is_leader")]
+        if slugs:
+            leader_slugs = slugs
+
     name = get_first_name(team[tg_id]["name"]) if tg_id in team else "Marco"
     greeting = text or f"¡Hola {name}! ¿Qué quieres hacer?"
-    keyboard  = main_menu_keyboard(is_manager)
+    keyboard  = main_menu_keyboard(is_manager, leader_slugs)
 
     if update.callback_query:
         await update.callback_query.edit_message_text(greeting, reply_markup=keyboard, parse_mode="Markdown")
@@ -332,11 +355,39 @@ async def crear_tarea_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await ask_assignee(update, context)
 
 async def ask_assignee(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from teams_manager import load_teams
-    team    = load_team()
-    members = get_members(team)
+    from teams_manager import load_teams, get_permissions
+    team      = load_team()
     task_name = context.user_data["new_task"]["name"]
 
+    # ── Modo líder: mostrar solo miembros del área ─────────────────────────────
+    leader_mode = context.user_data.get("leader_mode")
+    leader_area = context.user_data.get("leader_area_data", {})
+    if leader_mode and leader_area:
+        area_members = leader_area.get("members", [])
+        buttons = []
+        row = []
+        for m in area_members:
+            first = get_first_name(m["name"])
+            row.append(InlineKeyboardButton(first, callback_data=f"assign_{m['tg_id']}"))
+            if len(row) == 3:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        perms = get_permissions()
+        if perms.get("leader_can_assign_to_team", True) and len(area_members) > 1:
+            buttons.append([InlineKeyboardButton("👥 Todo el equipo", callback_data="assign_broadcast")])
+        buttons.append([InlineKeyboardButton("❌ Cancelar", callback_data="menu")])
+        msg = f"➕ *Nueva tarea para {leader_area['name']}:*\n📌 _{task_name}_\n\n👤 ¿A quién se la asignas?"
+        keyboard = InlineKeyboardMarkup(buttons)
+        if update.callback_query:
+            await update.callback_query.edit_message_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+        elif update.message:
+            await update.message.reply_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+        return TASK_ASSIGNEE
+
+    # ── Modo manager: todos los miembros ───────────────────────────────────────
+    members = get_members(team)
     buttons = []
     row = []
     for tid, info in members:
@@ -445,9 +496,91 @@ async def handle_area_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return TASK_DUE
 
 
+async def leader_create_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Líder inicia la creación de una tarea para su equipo."""
+    from teams_manager import get_areas_for_member
+    query = update.callback_query
+    await query.answer()
+    tg_id = update.effective_user.id
+    areas = [a for a in get_areas_for_member(tg_id) if a.get("is_leader")]
+    if not areas:
+        await query.edit_message_text("❌ No eres líder de ningún área.")
+        return ConversationHandler.END
+
+    # Si es líder de varias áreas, preguntar cuál
+    if len(areas) > 1:
+        buttons = [[InlineKeyboardButton(f"🏢 {a['name']}", callback_data=f"leader_area_pick_{a['slug']}")]
+                   for a in areas]
+        buttons.append([InlineKeyboardButton("❌ Cancelar", callback_data="menu")])
+        await query.edit_message_text(
+            "➕ *Crear tarea para tu equipo*\n\n¿Para cuál área?",
+            reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown",
+        )
+        return AREA_TASK_AREA  # reutilizamos estado para la selección de área
+
+    # Solo un área: usarla directamente
+    area = areas[0]
+    context.user_data["leader_mode"]      = True
+    context.user_data["leader_area_data"] = area
+    context.user_data["new_task"]         = {}
+    context.user_data["awaiting_task_name"] = True
+    await query.edit_message_text(
+        f"➕ *Crear tarea para {area['name']}*\n\nEscribe el nombre de la tarea:",
+        parse_mode="Markdown",
+    )
+    return TASK_ASSIGNEE
+
+
+async def leader_area_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Líder seleccionó el área cuando tiene más de una."""
+    from teams_manager import get_areas_for_member
+    query = update.callback_query
+    await query.answer()
+    slug  = query.data[len("leader_area_pick_"):]
+    tg_id = update.effective_user.id
+    areas = [a for a in get_areas_for_member(tg_id) if a.get("is_leader") and a["slug"] == slug]
+    if not areas:
+        await query.edit_message_text("❌ Área no encontrada.")
+        return ConversationHandler.END
+    area = areas[0]
+    context.user_data["leader_mode"]      = True
+    context.user_data["leader_area_data"] = area
+    context.user_data["new_task"]         = {}
+    context.user_data["awaiting_task_name"] = True
+    await query.edit_message_text(
+        f"➕ *Crear tarea para {area['name']}*\n\nEscribe el nombre de la tarea:",
+        parse_mode="Markdown",
+    )
+    return TASK_ASSIGNEE
+
+
 async def handle_assignee(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    # ── Broadcast: asignar a todo el equipo ──────────────────────────────────
+    if query.data == "assign_broadcast":
+        leader_area = context.user_data.get("leader_area_data", {})
+        context.user_data["new_task"]["assignee_tg_id"] = "broadcast"
+        context.user_data["new_task"]["assignee_gid"]   = "broadcast"
+        context.user_data["new_task"]["assignee_name"]  = f"Todo el equipo de {leader_area.get('name','área')}"
+        task_name = context.user_data["new_task"]["name"]
+        today    = datetime.now(TZ).date()
+        tomorrow = today + timedelta(days=1)
+        week_end = today + timedelta(days=(4 - today.weekday()) % 7 or 7)
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"Hoy ({today.strftime('%d/%m')})",      callback_data=f"due_{today}"),
+             InlineKeyboardButton(f"Mañana ({tomorrow.strftime('%d/%m')})", callback_data=f"due_{tomorrow}")],
+            [InlineKeyboardButton(f"Esta semana ({week_end.strftime('%d/%m')})", callback_data=f"due_{week_end}"),
+             InlineKeyboardButton("📅 Elegir fecha",                              callback_data="due_custom")],
+            [InlineKeyboardButton("Sin fecha límite", callback_data="due_none")],
+            [InlineKeyboardButton("❌ Cancelar", callback_data="menu")],
+        ])
+        await query.edit_message_text(
+            f"👥 *Todo el equipo*\n📌 _{task_name}_\n\n📅 ¿Cuándo vence?",
+            reply_markup=keyboard, parse_mode="Markdown")
+        return TASK_DUE
+
     tid = int(query.data[len("assign_"):])
     team = load_team()
     context.user_data["new_task"]["assignee_tg_id"] = tid
@@ -686,6 +819,61 @@ async def handle_task_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
     due_on  = task.get("due_on")
     notes   = task.get("notes")
 
+    # ── BROADCAST: asignar a todos los miembros del área ─────────────────────
+    if task.get("assignee_tg_id") == "broadcast":
+        leader_area = context.user_data.get("leader_area_data", {})
+        creator_tg_id = update.effective_user.id
+        team = load_team()
+        members = leader_area.get("members", [])
+        created_count = 0
+        from teams_manager import register_area_task
+        for m in members:
+            if m["tg_id"] not in team:
+                continue
+            try:
+                created = await create_asana_task(task["name"], m["asana_gid"], due_on, notes=notes)
+                t_gid   = created.get("gid", "")
+                known_tasks.setdefault(m["asana_gid"], set()).add(t_gid)
+                try:
+                    await add_task_to_member_project(t_gid, m["asana_gid"], ASANA_TOKEN)
+                except Exception:
+                    pass
+                register_area_task(
+                    task_gid=t_gid, task_name=task["name"],
+                    area_slug=leader_area.get("slug",""), area_name=leader_area.get("name",""),
+                    assigned_to_tg_id=m["tg_id"], assigned_to_name=m["name"],
+                    leader_tg_id=creator_tg_id, due_on=due_on,
+                )
+                try:
+                    await context.bot.send_message(
+                        chat_id=m["tg_id"],
+                        text=(f"🔔 *¡Nueva tarea, {get_first_name(m['name'])}!*\n\n"
+                              f"📌 *{task['name']}*\n"
+                              f"📅 Vence: {due_label(due_on)}\n"
+                              f"_Asignada por tu líder de área._"),
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("📋 Ver mis tareas", callback_data="ver_tareas")
+                        ]]),
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+                created_count += 1
+            except Exception as e:
+                logger.error(f"Error broadcast para {m['name']}: {e}")
+        save_known_tasks()
+        await query.edit_message_text(
+            f"🎉 *¡Tarea creada para todo el equipo!*\n\n"
+            f"📌 *{task['name']}*\n"
+            f"👥 {created_count} miembro(s) notificados\n"
+            f"📅 {due_label(due_on)}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Menú", callback_data="menu")]]),
+        )
+        for k in ("new_task","leader_mode","leader_area_data","awaiting_task_name"):
+            context.user_data.pop(k, None)
+        return ConversationHandler.END
+
     # Recurrencia nativa de Asana para daily/weekly/monthly
     asana_recurrence = None
     if freq == "daily":
@@ -821,7 +1009,22 @@ async def handle_task_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
             InlineKeyboardButton("⬅️ Menú",             callback_data="menu"),
         ]])
     )
-    context.user_data.pop("new_task", None)
+    # Si fue creada en modo líder para un miembro → registrar en area_tasks
+    leader_area = context.user_data.get("leader_area_data")
+    if leader_area and not area_slug:
+        try:
+            from teams_manager import register_area_task
+            register_area_task(
+                task_gid=task_gid, task_name=task["name"],
+                area_slug=leader_area.get("slug",""), area_name=leader_area.get("name",""),
+                assigned_to_tg_id=assignee_tg_id, assigned_to_name=task["assignee_name"],
+                leader_tg_id=update.effective_user.id, due_on=due_on,
+            )
+        except Exception as e:
+            logger.warning(f"No se pudo registrar tarea líder en area_tasks: {e}")
+
+    for k in ("new_task","leader_mode","leader_area_data","awaiting_task_name"):
+        context.user_data.pop(k, None)
     return ConversationHandler.END
 
 async def handle_task_add_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1107,6 +1310,120 @@ async def job_check_recurring_completed(context: ContextTypes.DEFAULT_TYPE):
     if changed:
         save_recurring(data)
 
+# ── REPORTES Y ACCIONES DE LÍDERES DE ÁREA ────────────────────────────────────
+
+async def leader_area_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Líder ve el reporte de su área."""
+    from teams_manager import get_areas_for_member
+    query = update.callback_query
+    await query.answer()
+    tg_id = update.effective_user.id
+    team  = load_team()
+    areas = [a for a in get_areas_for_member(tg_id) if a.get("is_leader")]
+    if not areas:
+        await query.edit_message_text("❌ No eres líder de ningún área.")
+        return
+
+    today = datetime.now(TZ).strftime("%d/%m/%Y")
+    for area in areas:
+        msg = f"📊 *Reporte de {area['name']} — {today}*\n\n"
+        has_data = False
+        for m in area.get("members", []):
+            m_tg_id = m["tg_id"]
+            if m_tg_id not in team:
+                continue
+            try:
+                tasks = await get_pending_tasks(team[m_tg_id]["asana_gid"])
+            except Exception:
+                tasks = []
+            od     = sum(1 for t in tasks if is_overdue(t))
+            status = "🟢" if not tasks else ("🔴" if od > 0 else "🟡")
+            first  = get_first_name(m["name"])
+            msg   += f"{status} *{first}* — {len(tasks)} pendiente(s)"
+            if od:
+                msg += f" ({od} vencida(s))"
+            msg += "\n"
+            for t in tasks[:3]:
+                due  = f" _{t['due_on']}_" if t.get("due_on") else ""
+                warn = " ⚠️" if is_overdue(t) else ""
+                msg += f"  • {t['name'][:40]}{due}{warn}\n"
+            msg += "\n"
+            has_data = True
+        if not has_data:
+            msg += "_Sin miembros con tareas registradas._"
+    await query.edit_message_text(
+        msg,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Menú", callback_data="menu")]]),
+    )
+
+
+async def leader_req_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Líder inicia solicitud de tarea al manager para otro equipo."""
+    from teams_manager import get_areas_for_member, get_permissions
+    query = update.callback_query
+    await query.answer()
+    tg_id = update.effective_user.id
+    perms = get_permissions()
+    if not perms.get("leader_can_request_delegation", True):
+        await query.edit_message_text("❌ No tienes permiso para solicitar tareas al manager.")
+        return ConversationHandler.END
+    areas = [a for a in get_areas_for_member(tg_id) if a.get("is_leader")]
+    if not areas:
+        await query.edit_message_text("❌ No eres líder de ningún área.")
+        return ConversationHandler.END
+    await query.edit_message_text(
+        "📤 *Solicitar tarea al manager*\n\n"
+        "Describe la tarea que necesitas que otro equipo realice.\n"
+        "El manager la recibirá y decidirá a qué área asignarla:",
+        parse_mode="Markdown",
+    )
+    return LEADER_REQ_TASK
+
+
+async def leader_req_task_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Recibe el texto de la solicitud y la envía al manager."""
+    from teams_manager import load_teams, save_delegation_request, get_areas_for_member
+    text  = update.message.text.strip()
+    tg_id = update.effective_user.id
+    team  = load_team()
+    leader_name = team.get(tg_id, {}).get("name", f"Líder ({tg_id})")
+
+    # Guardar solicitud en DB y obtener ID
+    req_id = save_delegation_request(tg_id, leader_name, text)
+
+    # Enviar al manager con botones por área
+    all_areas = load_teams()
+    area_buttons = []
+    for slug, area in all_areas.items():
+        cb = f"req_area_{req_id}_{slug}"
+        if len(cb) <= 64:  # Telegram callback limit
+            area_buttons.append([InlineKeyboardButton(f"🏢 {area['name']}", callback_data=cb)])
+    area_buttons.append([InlineKeyboardButton("🚫 Ignorar solicitud", callback_data=f"req_ignore_{req_id}")])
+
+    try:
+        await context.bot.send_message(
+            chat_id=MANAGER_CHAT_ID,
+            text=(
+                f"📤 *Solicitud de delegación*\n\n"
+                f"👤 De: *{leader_name}*\n\n"
+                f"📋 Tarea:\n_{text}_\n\n"
+                f"¿A cuál equipo la asignas?"
+            ),
+            reply_markup=InlineKeyboardMarkup(area_buttons),
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.error(f"Error enviando solicitud al manager: {e}")
+
+    await update.message.reply_text(
+        "✅ *Solicitud enviada al manager.*\nTe avisará cuando esté asignada.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Menú", callback_data="menu")]]),
+    )
+    return ConversationHandler.END
+
+
 # ── HANDLERS DE BOTONES GENERALES ──────────────────────────────────────────────
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1360,6 +1677,106 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("nl_task_draft", None)
         await show_main_menu(update, context, "❌ Tarea cancelada.")
 
+    # ── Menú líder ────────────────────────────────────────────────────────────
+    elif data == "leader_area_report":
+        await leader_area_report(update, context)
+
+    # ── Solicitud de delegación (manager responde) ────────────────────────────
+    elif data.startswith("req_area_"):
+        # "req_area_{req_id}_{slug}"
+        payload    = data[len("req_area_"):]
+        parts      = payload.split("_", 1)
+        req_id_str = parts[0]
+        slug       = parts[1] if len(parts) > 1 else ""
+        try:
+            req_id = int(req_id_str)
+        except ValueError:
+            await query.edit_message_text("❌ ID de solicitud inválido.")
+            return
+        from teams_manager import get_delegation_request, resolve_delegation_request, get_area, register_area_task
+        req  = get_delegation_request(req_id)
+        area = get_area(slug) if slug else None
+        if not req or not area:
+            await query.edit_message_text("❌ Solicitud o área no encontrada.")
+            return
+        if req.get("status") == "resolved":
+            await query.edit_message_text("✅ Esta solicitud ya fue procesada.")
+            return
+        # Crear tarea en Asana para el líder del área destino
+        try:
+            created  = await create_asana_task(req["task_text"], area["leader_asana_gid"])
+            task_gid = created.get("gid", "")
+        except Exception as e:
+            logger.error(f"Error creando tarea de solicitud: {e}")
+            await query.edit_message_text("❌ Error al crear la tarea en Asana.")
+            return
+        # Registrar en area_tasks
+        try:
+            register_area_task(
+                task_gid=task_gid, task_name=req["task_text"],
+                area_slug=slug, area_name=area["name"],
+                assigned_to_tg_id=area["leader_tg_id"], assigned_to_name=area["leader_name"],
+                leader_tg_id=area["leader_tg_id"],
+            )
+        except Exception:
+            pass
+        # Agregar al tablero del líder
+        try:
+            await add_task_to_member_project(task_gid, area["leader_asana_gid"], ASANA_TOKEN)
+        except Exception:
+            pass
+        # Notificar al líder del área destino con opciones de delegación
+        deleg_buttons = [
+            [InlineKeyboardButton("✅ Asumir yo", callback_data=f"asumir_{task_gid}")],
+        ]
+        for m in area.get("members", []):
+            deleg_buttons.append([InlineKeyboardButton(
+                f"🔀 Delegar a {get_first_name(m['name'])}",
+                callback_data=f"delegar_exec_{task_gid}_{m['tg_id']}_{slug}",
+            )])
+        deleg_buttons.append([InlineKeyboardButton("📋 Ver mis tareas", callback_data="ver_tareas")])
+        try:
+            await context.bot.send_message(
+                chat_id=area["leader_tg_id"],
+                text=(f"🏢 *Nueva tarea para {area['name']}*\n\n"
+                      f"📌 *{req['task_text'][:200]}*\n\n"
+                      f"_Enviada por {req['leader_name']} y aprobada por el manager._\n\n"
+                      f"¿La asumes tú o la delegas?"),
+                reply_markup=InlineKeyboardMarkup(deleg_buttons),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.error(f"Error notificando líder área destino: {e}")
+        # Notificar al líder solicitante
+        try:
+            await context.bot.send_message(
+                chat_id=req["leader_tg_id"],
+                text=(f"✅ *Tu solicitud fue asignada al área {area['name']}.*\n\n"
+                      f"📌 _{req['task_text'][:100]}_"),
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+        resolve_delegation_request(req_id)
+        await query.edit_message_text(
+            f"✅ *Tarea asignada al área {area['name']}.*\n\n"
+            f"El líder fue notificado para asumir o delegar.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Menú", callback_data="menu")]]),
+        )
+
+    elif data.startswith("req_ignore_"):
+        req_id_str = data[len("req_ignore_"):]
+        try:
+            from teams_manager import resolve_delegation_request
+            resolve_delegation_request(int(req_id_str))
+        except Exception:
+            pass
+        await query.edit_message_text(
+            "🚫 Solicitud ignorada.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Menú", callback_data="menu")]]),
+        )
+
     # ── Delegación de tareas de área ──────────────────────────────────────────
     elif data.startswith("asumir_"):
         task_gid = data[len("asumir_"):]
@@ -1532,6 +1949,53 @@ async def send_reminder(bot, tg_id: int, name: str, tasks: list, session: str):
     except Exception as e:
         logger.error(f"Error enviando a {tg_id}: {e}")
 
+async def _send_leader_area_reports(bot) -> None:
+    """Envía a cada líder de área un resumen de las tareas de su equipo."""
+    from teams_manager import load_teams, get_permissions
+    perms = get_permissions()
+    if not perms.get("leader_receives_reports", True):
+        return
+    team      = load_team()
+    all_areas = load_teams()
+    today_str = datetime.now(TZ).strftime("%d/%m/%Y")
+
+    for slug, area in all_areas.items():
+        leader_tg_id = area["leader_tg_id"]
+        if not area.get("members"):
+            continue
+        msg = f"📊 *Resumen de equipo — {area['name']} — {today_str}*\n\n"
+        has_data = False
+        for m in area["members"]:
+            m_tg_id = m["tg_id"]
+            if m_tg_id not in team:
+                continue
+            try:
+                tasks = await get_pending_tasks(team[m_tg_id]["asana_gid"])
+            except Exception:
+                tasks = []
+            if not tasks:
+                continue
+            od    = sum(1 for t in tasks if is_overdue(t))
+            status = "🔴" if od > 0 else "🟡"
+            msg  += f"{status} *{get_first_name(m['name'])}* — {len(tasks)} pendiente(s)\n"
+            for t in tasks[:2]:
+                due  = f" _{t['due_on']}_" if t.get("due_on") else ""
+                msg += f"  • {t['name'][:40]}{due}\n"
+            msg += "\n"
+            has_data = True
+        if not has_data:
+            continue
+        try:
+            await bot.send_message(
+                chat_id=leader_tg_id, text=msg, parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("📊 Ver reporte completo", callback_data="leader_area_report")
+                ]]),
+            )
+        except Exception as e:
+            logger.error(f"Error enviando reporte de área a líder {leader_tg_id}: {e}")
+
+
 async def job_morning(context: ContextTypes.DEFAULT_TYPE):
     team = load_team()
     for tg_id, info in team.items():
@@ -1539,6 +2003,7 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
             continue
         tasks = await get_pending_tasks(info["asana_gid"])
         await send_reminder(context.bot, tg_id, info["name"], tasks, "mañana")
+    await _send_leader_area_reports(context.bot)
 
 async def job_afternoon(context: ContextTypes.DEFAULT_TYPE):
     team = load_team()
@@ -1547,6 +2012,7 @@ async def job_afternoon(context: ContextTypes.DEFAULT_TYPE):
             continue
         tasks = await get_pending_tasks(info["asana_gid"])
         await send_reminder(context.bot, tg_id, info["name"], tasks, "tarde")
+    await _send_leader_area_reports(context.bot)
 
 async def job_daily_report(context: ContextTypes.DEFAULT_TYPE):
     await _send_report(context.bot)
@@ -3161,16 +3627,19 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("tarea", crear_tarea_start),
-            CallbackQueryHandler(crear_tarea_start, pattern="^crear_tarea_start$"),
+            CallbackQueryHandler(crear_tarea_start,          pattern="^crear_tarea_start$"),
+            CallbackQueryHandler(leader_create_task_start,   pattern="^leader_create_task$"),
         ],
         states={
             TASK_ASSIGNEE: [
-                CallbackQueryHandler(handle_area_start,                  pattern="^assign_area_start$"),
-                CallbackQueryHandler(handle_assignee,                    pattern="^assign_"),
+                CallbackQueryHandler(handle_area_start,   pattern="^assign_area_start$"),
+                CallbackQueryHandler(handle_assignee,     pattern="^assign_broadcast$"),
+                CallbackQueryHandler(handle_assignee,     pattern="^assign_\\d"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_task_name_text),
             ],
             AREA_TASK_AREA: [
-                CallbackQueryHandler(handle_area_select, pattern="^areasel_"),
+                CallbackQueryHandler(handle_area_select,  pattern="^areasel_"),
+                CallbackQueryHandler(leader_area_pick,    pattern="^leader_area_pick_"),
             ],
             TASK_DUE: [
                 CallbackQueryHandler(handle_due, pattern="^due_"),
@@ -3280,11 +3749,27 @@ def main():
         per_message=False,
     )
 
+    # ── ConversationHandler: líder solicita tarea al manager ─────────────────
+    leader_req_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(leader_req_task_start, pattern="^leader_req_task_start$")],
+        states={
+            LEADER_REQ_TASK: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, leader_req_task_receive),
+            ],
+        },
+        fallbacks=[
+            CallbackQueryHandler(show_main_menu, pattern="^menu$"),
+            CommandHandler("menu", cmd_menu),
+        ],
+        per_message=False,
+    )
+
     # ── Registrar handlers (orden importa: ConversationHandlers primero) ───────
     app.add_handler(conv_handler)
     app.add_handler(self_task_handler)
     app.add_handler(minuta_handler)
     app.add_handler(team_handler)
+    app.add_handler(leader_req_handler)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu",  cmd_menu))
     app.add_handler(CommandHandler("mi_id", cmd_mi_id))

@@ -284,3 +284,99 @@ def get_area_tasks_by_slug(slug: str, only_pending: bool = False) -> list:
         tasks = [t for t in tasks if t.get("status") == "pending"]
     # Más recientes primero
     return sorted(tasks, key=lambda t: t.get("created_at", ""), reverse=True)
+
+
+# ── PERMISOS ───────────────────────────────────────────────────────────────────
+
+DEFAULT_PERMISSIONS: dict = {
+    "leader_can_create_tasks":       True,   # Líderes pueden crear tareas para su equipo
+    "leader_can_assign_to_team":     True,   # Líderes pueden asignar a todo el equipo
+    "leader_receives_reports":       True,   # Líderes reciben reportes de su área
+    "leader_can_request_delegation": True,   # Líderes pueden pedir tareas al manager
+    "members_can_create_own_tasks":  True,   # Miembros pueden crear sus propias tareas
+}
+
+
+def get_permissions() -> dict:
+    """Lee permisos de DB. Mezcla con defaults para nuevas claves."""
+    try:
+        from db import db_get
+        perms = db_get("permissions")
+        if perms and isinstance(perms, dict):
+            return {**DEFAULT_PERMISSIONS, **perms}
+    except Exception:
+        pass
+    return DEFAULT_PERMISSIONS.copy()
+
+
+def save_permissions(perms: dict) -> None:
+    try:
+        from db import db_set
+        db_set("permissions", perms)
+    except Exception as e:
+        logger.warning(f"No se pudo guardar permisos: {e}")
+
+
+# ── ROLES DE MIEMBROS ─────────────────────────────────────────────────────────
+
+def set_member_role(slug: str, tg_id: int, role: str) -> bool:
+    """Asigna un rol a un miembro del área. role: 'member' | 'coordinator'"""
+    teams = load_teams()
+    if slug not in teams:
+        return False
+    for m in teams[slug]["members"]:
+        if m["tg_id"] == tg_id:
+            m["role"] = role
+            save_teams(teams)
+            return True
+    return False
+
+
+# ── SOLICITUDES DE DELEGACIÓN ─────────────────────────────────────────────────
+
+def save_delegation_request(leader_tg_id: int, leader_name: str, task_text: str) -> int:
+    """Guarda una solicitud de delegación. Devuelve el ID asignado."""
+    try:
+        from db import db_get, db_set
+        reqs = db_get("delegation_requests") or []
+        req_id = max((r["id"] for r in reqs), default=0) + 1
+        reqs.append({
+            "id":            req_id,
+            "leader_tg_id":  leader_tg_id,
+            "leader_name":   leader_name,
+            "task_text":     task_text,
+            "created_at":    datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
+            "status":        "pending",
+        })
+        db_set("delegation_requests", reqs[-100:])
+        return req_id
+    except Exception as e:
+        logger.warning(f"No se pudo guardar delegation_request: {e}")
+        return 0
+
+
+def get_delegation_request(req_id: int) -> dict | None:
+    try:
+        from db import db_get
+        reqs = db_get("delegation_requests") or []
+        return next((r for r in reqs if r["id"] == req_id), None)
+    except Exception:
+        return None
+
+
+def resolve_delegation_request(req_id: int) -> bool:
+    """Marca una solicitud como resuelta."""
+    try:
+        from db import db_get, db_set
+        reqs = db_get("delegation_requests") or []
+        changed = False
+        for r in reqs:
+            if r["id"] == req_id:
+                r["status"] = "resolved"
+                changed = True
+                break
+        if changed:
+            db_set("delegation_requests", reqs)
+        return changed
+    except Exception:
+        return False

@@ -543,10 +543,47 @@ async def update_area_leader(slug: str, request: Request, _=Depends(check_auth))
 
 @app.get("/api/areas/{slug}/tasks")
 async def get_area_tasks_endpoint(slug: str, _=Depends(check_auth)):
-    """Devuelve las tareas registradas para un área."""
     from teams_manager import get_area_tasks_by_slug
-    tasks = get_area_tasks_by_slug(slug)
-    return tasks
+    return get_area_tasks_by_slug(slug)
+
+# ── Eliminar tarea (solo manager) ──────────────────────────────────────────────
+
+@app.delete("/api/tasks/{task_gid}")
+async def delete_task_endpoint(task_gid: str, _=Depends(check_auth)):
+    """Elimina (completa/archiva) una tarea en Asana. Solo el manager puede hacerlo."""
+    import os
+    from utils import http_client, ASANA_BASE
+    token = os.environ.get("ASANA_TOKEN", "")
+    if not token:
+        raise HTTPException(500, "ASANA_TOKEN no configurado")
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    try:
+        r = await http_client.delete(
+            f"{ASANA_BASE}/tasks/{task_gid}", headers=headers, timeout=15
+        )
+        if r.status_code not in (200, 204):
+            raise HTTPException(r.status_code, f"Asana error: {r.text[:200]}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    return {"ok": True}
+
+# ── Permisos ───────────────────────────────────────────────────────────────────
+
+@app.get("/api/permissions")
+async def get_permissions_endpoint(_=Depends(check_auth)):
+    from teams_manager import get_permissions
+    return get_permissions()
+
+@app.post("/api/permissions")
+async def save_permissions_endpoint(request: Request, _=Depends(check_auth)):
+    body = await request.json()
+    from teams_manager import DEFAULT_PERMISSIONS, save_permissions
+    # Solo guardar claves conocidas (evitar inyección)
+    filtered = {k: bool(body.get(k, v)) for k, v in DEFAULT_PERMISSIONS.items()}
+    save_permissions(filtered)
+    return {"ok": True}
 
 @app.get("/health")
 async def health():
@@ -725,6 +762,7 @@ select.form-input{cursor:pointer}
     <div class="nav-item" onclick="tab('areas',this)"><span class="nav-icon">🏢</span>Áreas</div>
     <div class="nav-item" onclick="tab('no-cumplidas',this)"><span class="nav-icon">📋</span>No Cumplidas</div>
     <div class="nav-item" onclick="tab('api-ia',this)"><span class="nav-icon">🤖</span>API / IA</div>
+    <div class="nav-item" onclick="tab('permisos',this)"><span class="nav-icon">🔐</span>Permisos</div>
     <div class="nav-item" onclick="tab('config',this)"><span class="nav-icon">⚙️</span>Configuración</div>
   </nav>
 </aside>
@@ -807,6 +845,16 @@ select.form-input{cursor:pointer}
     <div class="page-sub">Configura el modelo Gemini para procesamiento de minutas.</div></div>
   </div>
   <div id="ai-body"><div class="loader"><span class="spin">⟳</span></div></div>
+</div>
+
+<!-- ═══ PERMISOS ═══ -->
+<div id="tab-permisos" class="tab-content">
+  <div class="page-header">
+    <div><div class="page-title">Permisos</div>
+    <div class="page-sub">Configura qué pueden hacer los líderes y miembros de área.</div></div>
+    <button class="btn btn-primary" onclick="savePermisos()">💾 Guardar permisos</button>
+  </div>
+  <div id="permisos-body"><div class="loader"><span class="spin">⟳</span></div></div>
 </div>
 
 <!-- ═══ CONFIGURACIÓN ═══ -->
@@ -1051,7 +1099,8 @@ function tab(name, el) {
     dashboard:'loadDashboard', checklist:'loadChecklist',
     recurrentes:'loadRecurrentes', equipo:'loadTeam',
     'no-cumplidas':'loadNoncompliant', 'api-ia':'loadGemini',
-    config:'loadConfig'
+    config:'loadConfig', permisos:'loadPermisos',
+    areas:'loadAreas'
   };
   window[loaders[name]]?.();
 }
@@ -1105,6 +1154,7 @@ async function loadDashboard() {
           <span class="task-due${od?' overdue':''}">${fmt(t.due_on)}</span>
           ${t.permalink_url?`<a class="task-link" href="${t.permalink_url}" target="_blank">↗</a>`:''}
           <button class="btn btn-sm btn-success" onclick="completarTarea('${t.gid}',this)" title="Marcar completada">✓</button>
+          <button class="btn btn-sm btn-danger" onclick="eliminarTarea('${t.gid}','${t.name.replace(/'/g,'')}',this)" title="Eliminar tarea">🗑</button>
         </div>`;
       }).join('');
       return `<div class="person-block">
@@ -1262,6 +1312,21 @@ async function completarTarea(gid, btn) {
   } catch(e) {
     toast('Error: ' + e.message, false);
     btn.disabled = false; btn.textContent = '✓';
+  }
+}
+
+/* ── Eliminar tarea desde dashboard (solo manager) ── */
+async function eliminarTarea(gid, name, btn) {
+  if (!confirm(`¿Eliminar la tarea "${name}"? Esta acción no se puede deshacer.`)) return;
+  btn.disabled = true; btn.textContent = '...';
+  try {
+    await api('DELETE', `/api/tasks/${gid}`);
+    const row = document.getElementById('tr-' + gid);
+    if (row) row.remove();
+    toast('🗑 Tarea eliminada');
+  } catch(e) {
+    toast('Error: ' + e.message, false);
+    btn.disabled = false; btn.textContent = '🗑';
   }
 }
 
@@ -1757,6 +1822,47 @@ document.querySelectorAll('.modal-overlay').forEach(o =>
 );
 
 /* ── Init ── */
+/* ══════════ PERMISOS ══════════ */
+const PERM_LABELS = {
+  leader_can_create_tasks:       'Líderes pueden crear tareas para su equipo',
+  leader_can_assign_to_team:     'Líderes pueden asignar tareas a todo el equipo',
+  leader_receives_reports:       'Líderes reciben reportes de su área',
+  leader_can_request_delegation: 'Líderes pueden solicitar tareas al manager',
+  members_can_create_own_tasks:  'Miembros pueden crear sus propias tareas',
+};
+
+async function loadPermisos() {
+  const body = document.getElementById('permisos-body');
+  body.innerHTML = '<div class="loader"><span class="spin">⟳</span></div>';
+  try {
+    const perms = await api('GET', '/api/permissions');
+    body.innerHTML = Object.entries(PERM_LABELS).map(([key, label]) => `
+      <div style="display:flex;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid var(--border)">
+        <label class="toggle-wrap" style="cursor:pointer;display:flex;align-items:center;gap:10px;flex:1">
+          <input type="checkbox" id="perm-${key}" ${perms[key] ? 'checked' : ''} style="width:18px;height:18px;cursor:pointer">
+          <span style="font-size:14px">${label}</span>
+        </label>
+      </div>`).join('');
+  } catch(e) {
+    body.innerHTML = `<p style="color:var(--danger)">Error cargando permisos: ${e.message}</p>`;
+  }
+}
+
+async function savePermisos() {
+  const keys = Object.keys(PERM_LABELS);
+  const perms = {};
+  keys.forEach(k => {
+    const el = document.getElementById('perm-' + k);
+    if (el) perms[k] = el.checked;
+  });
+  try {
+    await api('POST', '/api/permissions', perms);
+    toast('✅ Permisos guardados');
+  } catch(e) {
+    toast('Error: ' + e.message, false);
+  }
+}
+
 loadDashboard();
 loadTeam();  // pre-carga para el modal de recurrentes
 </script>
