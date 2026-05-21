@@ -541,6 +541,13 @@ async def update_area_leader(slug: str, request: Request, _=Depends(check_auth))
         raise HTTPException(404, "Área no encontrada")
     return {"ok": True}
 
+@app.get("/api/areas/{slug}/tasks")
+async def get_area_tasks_endpoint(slug: str, _=Depends(check_auth)):
+    """Devuelve las tareas registradas para un área."""
+    from teams_manager import get_area_tasks_by_slug
+    tasks = get_area_tasks_by_slug(slug)
+    return tasks
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -1422,6 +1429,7 @@ async function loadAreas() {
             <div class="btn-group">
               <button class="btn btn-sm" onclick="openChangeLeaderModal('${a.slug}','${a.leader_tg_id}')" title="Cambiar líder">👑</button>
               <button class="btn btn-sm btn-primary" onclick="openAddAreaMemberModal('${a.slug}')">+ Miembro</button>
+              <button class="btn btn-sm" onclick="toggleAreaTasks('${a.slug}',this)" title="Ver tareas">📋</button>
               <button class="btn btn-sm btn-danger" onclick="confirmDeleteArea('${a.slug}','${a.name}')">✕</button>
             </div>
           </div>
@@ -1430,6 +1438,10 @@ async function loadAreas() {
                <div>${memberRows}</div>`
             : `<div class="empty-msg" style="font-size:12px">Sin miembros. Agrega colaboradores con "+ Miembro".</div>`
           }
+          <div id="area-tasks-${a.slug}" style="display:none;margin-top:14px;border-top:1px solid var(--border);padding-top:12px">
+            <div style="font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px">TAREAS DEL ÁREA</div>
+            <div id="area-tasks-body-${a.slug}"><span style="color:var(--text2);font-size:13px">Cargando...</span></div>
+          </div>
         </div>`;
     }).join('');
     document.getElementById('areas-body').innerHTML = `<div style="max-width:640px">${cards}</div>`;
@@ -1442,6 +1454,58 @@ function getInitials(name) {
   const words = name.split('(')[0].trim().split(' ');
   return words.slice(0,2).map(w=>w[0]?.toUpperCase()||'').join('');
 }
+
+async function toggleAreaTasks(slug, btn) {
+  const panel = document.getElementById(`area-tasks-${slug}`);
+  if (panel.style.display === 'none') {
+    panel.style.display = 'block';
+    btn.textContent = '📋✕';
+    await loadAreaTasks(slug);
+  } else {
+    panel.style.display = 'none';
+    btn.textContent = '📋';
+  }
+}
+
+async function loadAreaTasks(slug) {
+  const container = document.getElementById(`area-tasks-body-${slug}`);
+  try {
+    const tasks = await api('GET', `/api/areas/${slug}/tasks`);
+    if (!tasks.length) {
+      container.innerHTML = '<p style="font-size:13px;color:var(--text2)">Sin tareas registradas.</p>';
+      return;
+    }
+    const pending   = tasks.filter(t => t.status === 'pending');
+    const completed = tasks.filter(t => t.status === 'completed');
+    const renderRow = t => {
+      const icon     = t.status === 'completed' ? '✅' : '⏳';
+      const dueStr   = t.due_on   ? ` <span style="color:var(--text2);font-size:11px">📅 ${t.due_on}</span>` : '';
+      const whoStr   = t.assigned_to_name ? ` <span style="color:var(--text2);font-size:11px">👤 ${t.assigned_to_name.split('(')[0].trim()}</span>` : '';
+      const crossStyle = t.status === 'completed' ? 'text-decoration:line-through;opacity:.6' : '';
+      return `<div style="display:flex;align-items:flex-start;gap:8px;padding:6px 0;border-bottom:1px solid var(--border)">
+        <span style="margin-top:1px">${icon}</span>
+        <div style="flex:1">
+          <div style="font-size:13px;${crossStyle}">${t.task_name}</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:2px">${whoStr}${dueStr}</div>
+        </div>
+      </div>`;
+    };
+    let html = '';
+    if (pending.length) {
+      html += `<div style="font-size:11px;color:var(--text2);font-weight:600;margin-bottom:4px">PENDIENTES (${pending.length})</div>`;
+      html += pending.map(renderRow).join('');
+    }
+    if (completed.length) {
+      html += `<div style="font-size:11px;color:var(--text2);font-weight:600;margin:10px 0 4px">COMPLETADAS (${completed.length})</div>`;
+      html += completed.slice(0, 10).map(renderRow).join('');
+      if (completed.length > 10) html += `<p style="font-size:12px;color:var(--text2)">… y ${completed.length - 10} más.</p>`;
+    }
+    container.innerHTML = html;
+  } catch(e) {
+    container.innerHTML = `<p style="color:#B91C1C;font-size:13px">Error: ${e.message}</p>`;
+  }
+}
+
 function get_color(name) {
   const nl = name.toLowerCase();
   const map = {manager:'#D4537E',ventas:'#1D9E75','logística':'#D85A30','almacén':'#D85A30',

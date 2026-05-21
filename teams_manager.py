@@ -13,16 +13,34 @@ Estructura en DB / teams.json:
     ]
   }
 }
+
+Estructura de area_tasks (DB / area_tasks.json):
+[
+  {
+    "task_gid": "...",
+    "task_name": "Revisar inventario",
+    "area_slug": "almacen",
+    "area_name": "Almacén",
+    "assigned_to_tg_id": 12345,
+    "assigned_to_name": "Pedro",
+    "leader_tg_id": 99999,
+    "due_on": "2026-05-25",
+    "created_at": "2026-05-21",
+    "status": "pending"  // pending | completed
+  }
+]
 """
 
 import json
 import re
 import logging
+from datetime import datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-TEAMS_FILE = Path(__file__).parent / "teams.json"
+TEAMS_FILE      = Path(__file__).parent / "teams.json"
+AREA_TASKS_FILE = Path(__file__).parent / "area_tasks.json"
 
 
 def _slugify(name: str) -> str:
@@ -150,3 +168,119 @@ def get_areas_for_member(tg_id: int) -> list[dict]:
         if is_leader or is_member:
             result.append({"slug": slug, **t, "is_leader": is_leader})
     return result
+
+
+# ── REGISTRO DE TAREAS DE ÁREA ────────────────────────────────────────────────
+
+def load_area_tasks() -> list:
+    """Carga el registro de tareas de área. DB primero, archivo local como fallback."""
+    try:
+        from db import db_get
+        data = db_get("area_tasks")
+        if data is not None:
+            return data
+    except Exception:
+        pass
+    if AREA_TASKS_FILE.exists():
+        try:
+            return json.loads(AREA_TASKS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return []
+
+
+def save_area_tasks(tasks: list):
+    """Guarda en DB y archivo local. Mantiene máximo 500 registros."""
+    if len(tasks) > 500:
+        tasks = tasks[-500:]
+    try:
+        from db import db_set
+        db_set("area_tasks", tasks)
+    except Exception as e:
+        logger.warning(f"No se pudo guardar area_tasks en DB: {e}")
+    try:
+        AREA_TASKS_FILE.write_text(
+            json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as e:
+        logger.warning(f"No se pudo guardar area_tasks en archivo: {e}")
+
+
+def register_area_task(
+    task_gid: str,
+    task_name: str,
+    area_slug: str,
+    area_name: str,
+    assigned_to_tg_id: int,
+    assigned_to_name: str,
+    leader_tg_id: int,
+    due_on: str = None,
+) -> None:
+    """Registra una tarea recién creada para un área."""
+    tasks = load_area_tasks()
+    tasks.append({
+        "task_gid":          task_gid,
+        "task_name":         task_name,
+        "area_slug":         area_slug,
+        "area_name":         area_name,
+        "assigned_to_tg_id": assigned_to_tg_id,
+        "assigned_to_name":  assigned_to_name,
+        "leader_tg_id":      leader_tg_id,
+        "due_on":            due_on,
+        "created_at":        datetime.utcnow().strftime("%Y-%m-%d"),
+        "status":            "pending",
+    })
+    save_area_tasks(tasks)
+    logger.info(f"Tarea de área registrada: {task_name} → {area_name} ({assigned_to_name})")
+
+
+def update_area_task_assignee(task_gid: str, new_tg_id: int, new_name: str) -> bool:
+    """Actualiza el responsable de una tarea de área (cuando el líder la delega)."""
+    tasks   = load_area_tasks()
+    changed = False
+    for t in tasks:
+        if t["task_gid"] == task_gid:
+            t["assigned_to_tg_id"] = new_tg_id
+            t["assigned_to_name"]  = new_name
+            changed = True
+            break
+    if changed:
+        save_area_tasks(tasks)
+    return changed
+
+
+def complete_area_task(task_gid: str) -> dict | None:
+    """
+    Marca una tarea de área como completada.
+    Devuelve el registro si existía y estaba pendiente, o None si no aplica.
+    """
+    tasks   = load_area_tasks()
+    changed = False
+    result  = None
+    for t in tasks:
+        if t["task_gid"] == task_gid and t.get("status") == "pending":
+            t["status"]       = "completed"
+            t["completed_at"] = datetime.utcnow().strftime("%Y-%m-%d")
+            result  = t
+            changed = True
+            break
+    if changed:
+        save_area_tasks(tasks)
+    return result
+
+
+def get_area_task_by_gid(task_gid: str) -> dict | None:
+    """Busca una tarea de área por su GID de Asana."""
+    for t in load_area_tasks():
+        if t["task_gid"] == task_gid:
+            return t
+    return None
+
+
+def get_area_tasks_by_slug(slug: str, only_pending: bool = False) -> list:
+    """Devuelve tareas de un área. Opcionalmente filtra solo las pendientes."""
+    tasks = [t for t in load_area_tasks() if t["area_slug"] == slug]
+    if only_pending:
+        tasks = [t for t in tasks if t.get("status") == "pending"]
+    # Más recientes primero
+    return sorted(tasks, key=lambda t: t.get("created_at", ""), reverse=True)

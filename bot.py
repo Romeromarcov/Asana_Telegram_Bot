@@ -753,7 +753,21 @@ async def handle_task_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         if area_slug:
             # ── Tarea asignada a un área: notificar al líder con opciones ────────
-            from teams_manager import get_area
+            from teams_manager import get_area, register_area_task
+            # Registrar en el tracker de tareas de área
+            try:
+                register_area_task(
+                    task_gid          = task_gid,
+                    task_name         = task["name"],
+                    area_slug         = area_slug,
+                    area_name         = task.get("area_name", area_slug),
+                    assigned_to_tg_id = assignee_tg_id,
+                    assigned_to_name  = task["assignee_name"],
+                    leader_tg_id      = assignee_tg_id,  # inicialmente el líder
+                    due_on            = due_on,
+                )
+            except Exception as e:
+                logger.warning(f"No se pudo registrar tarea de área: {e}")
             area = get_area(area_slug)
             if area:
                 deleg_buttons = [
@@ -1165,6 +1179,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     rec_changed = True
             if rec_changed:
                 save_recurring(rec_data)
+
+            # Notificar al líder si era una tarea delegada de área
+            try:
+                from teams_manager import complete_area_task
+                area_record = complete_area_task(task_gid)
+                if area_record and area_record["assigned_to_tg_id"] != area_record["leader_tg_id"]:
+                    await context.bot.send_message(
+                        chat_id=area_record["leader_tg_id"],
+                        text=(
+                            f"✅ *{area_record['assigned_to_name']}* completó la tarea "
+                            f"del área *{area_record['area_name']}*:\n\n"
+                            f"📌 _{area_record['task_name']}_"
+                        ),
+                        parse_mode="Markdown",
+                    )
+            except Exception as e:
+                logger.warning(f"No se pudo notificar completado de área: {e}")
+
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Completar otra", callback_data="completar_menu")],
                 [InlineKeyboardButton("⬅️ Menú",          callback_data="menu")],
@@ -1359,7 +1391,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task_gid, member_tg_id_str, area_slug = parts
         member_tg_id = int(member_tg_id_str)
 
-        from teams_manager import get_area
+        from teams_manager import get_area, update_area_task_assignee
         area = get_area(area_slug)
         if not area:
             await query.edit_message_text("❌ Área no encontrada.")
@@ -1385,6 +1417,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         known_tasks.setdefault(member_info["asana_gid"], set()).add(task_gid)
         save_known_tasks()
+
+        # Actualizar el registro de área (cambiar responsable)
+        try:
+            update_area_task_assignee(task_gid, member_tg_id, member_info["name"])
+        except Exception as e:
+            logger.warning(f"No se pudo actualizar asignado en area_tasks: {e}")
 
         # Notificar al miembro
         member_first = get_first_name(member_info["name"])
