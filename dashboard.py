@@ -459,6 +459,88 @@ async def save_gemini_model(request: Request, _=Depends(check_auth)):
     db_set("gemini_model", model)
     return {"ok": True, "model": model}
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ÁREAS DE TRABAJO
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/areas")
+async def api_areas(_=Depends(check_auth)):
+    from teams_manager import load_teams
+    teams = load_teams()
+    result = []
+    for slug, t in teams.items():
+        result.append({
+            "slug":         slug,
+            "name":         t["name"],
+            "leader_name":  t["leader_name"],
+            "leader_tg_id": t["leader_tg_id"],
+            "members":      t.get("members", []),
+        })
+    return result
+
+@app.post("/api/areas")
+async def create_area_endpoint(request: Request, _=Depends(check_auth)):
+    body         = await request.json()
+    name         = body.get("name", "").strip()
+    leader_tg_id = int(body.get("leader_tg_id", 0))
+    if not name or not leader_tg_id:
+        raise HTTPException(400, "name y leader_tg_id son obligatorios")
+    team = load_team()
+    if leader_tg_id not in team:
+        raise HTTPException(400, "El líder no está registrado en el equipo")
+    leader = team[leader_tg_id]
+    from teams_manager import create_area
+    try:
+        slug = create_area(name, leader_tg_id, leader["asana_gid"], leader["name"])
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    return {"ok": True, "slug": slug}
+
+@app.delete("/api/areas/{slug}")
+async def delete_area_endpoint(slug: str, _=Depends(check_auth)):
+    from teams_manager import delete_area
+    if not delete_area(slug):
+        raise HTTPException(404, "Área no encontrada")
+    return {"ok": True}
+
+@app.post("/api/areas/{slug}/members")
+async def add_area_member(slug: str, request: Request, _=Depends(check_auth)):
+    body  = await request.json()
+    tg_id = int(body.get("tg_id", 0))
+    if not tg_id:
+        raise HTTPException(400, "tg_id requerido")
+    team = load_team()
+    if tg_id not in team:
+        raise HTTPException(400, "El miembro no está registrado en el equipo")
+    member = team[tg_id]
+    from teams_manager import add_member
+    ok = add_member(slug, tg_id, member["asana_gid"], member["name"])
+    if not ok:
+        raise HTTPException(409, "Miembro ya existe en el área o área no encontrada")
+    return {"ok": True}
+
+@app.delete("/api/areas/{slug}/members/{tg_id}")
+async def remove_area_member(slug: str, tg_id: int, _=Depends(check_auth)):
+    from teams_manager import remove_member
+    if not remove_member(slug, tg_id):
+        raise HTTPException(404, "Miembro o área no encontrada")
+    return {"ok": True}
+
+@app.put("/api/areas/{slug}/leader")
+async def update_area_leader(slug: str, request: Request, _=Depends(check_auth)):
+    body         = await request.json()
+    leader_tg_id = int(body.get("leader_tg_id", 0))
+    if not leader_tg_id:
+        raise HTTPException(400, "leader_tg_id requerido")
+    team = load_team()
+    if leader_tg_id not in team:
+        raise HTTPException(400, "El líder no está registrado en el equipo")
+    leader = team[leader_tg_id]
+    from teams_manager import update_leader
+    if not update_leader(slug, leader_tg_id, leader["asana_gid"], leader["name"]):
+        raise HTTPException(404, "Área no encontrada")
+    return {"ok": True}
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -633,6 +715,7 @@ select.form-input{cursor:pointer}
     <div class="nav-item" onclick="tab('checklist',this)"><span class="nav-icon">✅</span>Checklist</div>
     <div class="nav-item" onclick="tab('recurrentes',this)"><span class="nav-icon">🔁</span>Recurrentes</div>
     <div class="nav-item" onclick="tab('equipo',this)"><span class="nav-icon">👥</span>Equipo</div>
+    <div class="nav-item" onclick="tab('areas',this)"><span class="nav-icon">🏢</span>Áreas</div>
     <div class="nav-item" onclick="tab('no-cumplidas',this)"><span class="nav-icon">📋</span>No Cumplidas</div>
     <div class="nav-item" onclick="tab('api-ia',this)"><span class="nav-icon">🤖</span>API / IA</div>
     <div class="nav-item" onclick="tab('config',this)"><span class="nav-icon">⚙️</span>Configuración</div>
@@ -685,6 +768,19 @@ select.form-input{cursor:pointer}
     </div>
   </div>
   <div id="team-body" class="team-grid"><div class="loader"><span class="spin">⟳</span></div></div>
+</div>
+
+<!-- ═══ ÁREAS ═══ -->
+<div id="tab-areas" class="tab-content">
+  <div class="page-header">
+    <div><div class="page-title">Áreas de Trabajo</div>
+    <div class="page-sub">Equipos con líder y miembros para delegación de tareas.</div></div>
+    <div class="btn-group">
+      <button class="btn" onclick="loadAreas()">↻ Actualizar</button>
+      <button class="btn btn-primary" onclick="openAddAreaModal()">+ Nueva área</button>
+    </div>
+  </div>
+  <div id="areas-body"><div class="loader"><span class="spin">⟳</span></div></div>
 </div>
 
 <!-- ═══ NO CUMPLIDAS ═══ -->
@@ -830,6 +926,67 @@ select.form-input{cursor:pointer}
     <div class="modal-footer">
       <button class="btn" onclick="closeModal('edit-rec-modal')">Cancelar</button>
       <button class="btn btn-primary" onclick="submitEditRec()">Guardar cambios</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ MODAL: Nueva área ═══ -->
+<div class="modal-overlay" id="add-area-modal">
+  <div class="modal">
+    <div class="modal-title">🏢 Nueva área de trabajo</div>
+    <div class="modal-body">
+      <div>
+        <label class="form-label">Nombre del área</label>
+        <input class="form-input" id="area-name" placeholder="Ej: Administración, Ventas, Logística">
+      </div>
+      <div>
+        <label class="form-label">Líder del área</label>
+        <select class="form-input" id="area-leader"></select>
+      </div>
+      <div class="info-box">
+        <span>ℹ️</span>
+        <div>El líder recibe las tareas del área y puede delegarlas a los miembros desde Telegram.</div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal('add-area-modal')">Cancelar</button>
+      <button class="btn btn-primary" onclick="submitAddArea()">Crear área</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ MODAL: Agregar miembro al área ═══ -->
+<div class="modal-overlay" id="add-area-member-modal">
+  <div class="modal">
+    <div class="modal-title">👤 Agregar miembro al área</div>
+    <div class="modal-body">
+      <input type="hidden" id="area-member-slug">
+      <div>
+        <label class="form-label">Seleccionar miembro</label>
+        <select class="form-input" id="area-member-select"></select>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal('add-area-member-modal')">Cancelar</button>
+      <button class="btn btn-primary" onclick="submitAddAreaMember()">Agregar</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ MODAL: Cambiar líder del área ═══ -->
+<div class="modal-overlay" id="change-leader-modal">
+  <div class="modal">
+    <div class="modal-title">👑 Cambiar líder del área</div>
+    <div class="modal-body">
+      <input type="hidden" id="change-leader-slug">
+      <div>
+        <label class="form-label">Nuevo líder</label>
+        <select class="form-input" id="change-leader-select"></select>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal('change-leader-modal')">Cancelar</button>
+      <button class="btn btn-primary" onclick="submitChangeLeader()">Guardar</button>
     </div>
   </div>
 </div>
@@ -1233,6 +1390,144 @@ async function submitAddMember() {
     toast(`✅ ${name.split('(')[0].trim()} agregado al equipo`);
     closeModal('add-member-modal');
     loadTeam();
+  } catch(e) { toast('Error: ' + e.message, false); }
+}
+
+/* ══════════ ÁREAS ══════════ */
+async function loadAreas() {
+  document.getElementById('areas-body').innerHTML = '<div class="loader"><span class="spin">⟳</span></div>';
+  try {
+    const areas = await api('GET', '/api/areas');
+    if (!areas.length) {
+      document.getElementById('areas-body').innerHTML =
+        '<p class="empty-msg">No hay áreas creadas. Crea la primera con "+ Nueva área".</p>';
+      return;
+    }
+    const cards = areas.map(a => {
+      const memberRows = a.members.map(m => `
+        <div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border)">
+          ${avt(getInitials(m.name), get_color(m.name), 26, 10)}
+          <span style="flex:1;font-size:13px">${m.name.split('(')[0].trim()}</span>
+          <button class="btn btn-sm btn-danger" onclick="removeAreaMember('${a.slug}',${m.tg_id},'${m.name.split('(')[0].trim()}',this)">✕</button>
+        </div>`).join('');
+      return `
+        <div class="card" style="margin-bottom:16px">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+            <div>
+              <div style="font-size:16px;font-weight:700">🏢 ${a.name}</div>
+              <div style="font-size:12px;color:var(--text2);margin-top:2px">
+                👑 Líder: <strong>${a.leader_name.split('(')[0].trim()}</strong>
+              </div>
+            </div>
+            <div class="btn-group">
+              <button class="btn btn-sm" onclick="openChangeLeaderModal('${a.slug}','${a.leader_tg_id}')" title="Cambiar líder">👑</button>
+              <button class="btn btn-sm btn-primary" onclick="openAddAreaMemberModal('${a.slug}')">+ Miembro</button>
+              <button class="btn btn-sm btn-danger" onclick="confirmDeleteArea('${a.slug}','${a.name}')">✕</button>
+            </div>
+          </div>
+          ${a.members.length
+            ? `<div style="font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px">MIEMBROS (${a.members.length})</div>
+               <div>${memberRows}</div>`
+            : `<div class="empty-msg" style="font-size:12px">Sin miembros. Agrega colaboradores con "+ Miembro".</div>`
+          }
+        </div>`;
+    }).join('');
+    document.getElementById('areas-body').innerHTML = `<div style="max-width:640px">${cards}</div>`;
+  } catch(e) {
+    document.getElementById('areas-body').innerHTML = `<p style="color:#B91C1C">Error: ${e.message}</p>`;
+  }
+}
+
+function getInitials(name) {
+  const words = name.split('(')[0].trim().split(' ');
+  return words.slice(0,2).map(w=>w[0]?.toUpperCase()||'').join('');
+}
+function get_color(name) {
+  const nl = name.toLowerCase();
+  const map = {manager:'#D4537E',ventas:'#1D9E75','logística':'#D85A30','almacén':'#D85A30',
+    admin:'#378ADD',cobranza:'#7F77DD',finanzas:'#EF9F27','atención':'#7F77DD'};
+  for (const [k,v] of Object.entries(map)) if (nl.includes(k)) return v;
+  return '#8B9BAB';
+}
+
+function openAddAreaModal() {
+  document.getElementById('area-name').value = '';
+  document.getElementById('area-leader').innerHTML = teamCache.map(m =>
+    `<option value="${m.tg_id}">${m.name.split('(')[0].trim()} — ${(m.name.match(/\((.+)\)/)||['',''])[1]}</option>`
+  ).join('');
+  document.getElementById('add-area-modal').classList.add('open');
+}
+
+async function submitAddArea() {
+  const name = document.getElementById('area-name').value.trim();
+  const leader_tg_id = parseInt(document.getElementById('area-leader').value);
+  if (!name) { toast('Escribe el nombre del área', false); return; }
+  try {
+    await api('POST', '/api/areas', { name, leader_tg_id });
+    toast(`✅ Área "${name}" creada`);
+    closeModal('add-area-modal');
+    loadAreas();
+  } catch(e) { toast('Error: ' + e.message, false); }
+}
+
+async function confirmDeleteArea(slug, name) {
+  document.getElementById('del-msg').textContent = `¿Eliminar el área "${name}"? Esta acción no se puede deshacer.`;
+  document.getElementById('del-confirm-btn').onclick = async () => {
+    closeModal('del-modal');
+    try {
+      await api('DELETE', `/api/areas/${slug}`);
+      toast(`🗑 Área "${name}" eliminada`);
+      loadAreas();
+    } catch(e) { toast('Error: ' + e.message, false); }
+  };
+  document.getElementById('del-modal').classList.add('open');
+}
+
+function openAddAreaMemberModal(slug) {
+  document.getElementById('area-member-slug').value = slug;
+  document.getElementById('area-member-select').innerHTML = teamCache.map(m =>
+    `<option value="${m.tg_id}">${m.name.split('(')[0].trim()} — ${(m.name.match(/\((.+)\)/)||['',''])[1]}</option>`
+  ).join('');
+  document.getElementById('add-area-member-modal').classList.add('open');
+}
+
+async function submitAddAreaMember() {
+  const slug  = document.getElementById('area-member-slug').value;
+  const tg_id = parseInt(document.getElementById('area-member-select').value);
+  try {
+    await api('POST', `/api/areas/${slug}/members`, { tg_id });
+    toast('✅ Miembro agregado al área');
+    closeModal('add-area-member-modal');
+    loadAreas();
+  } catch(e) { toast('Error: ' + e.message, false); }
+}
+
+async function removeAreaMember(slug, tg_id, name, btn) {
+  if (!confirm(`¿Quitar a "${name}" del área?`)) return;
+  btn.disabled = true;
+  try {
+    await api('DELETE', `/api/areas/${slug}/members/${tg_id}`);
+    toast(`👤 ${name} quitado del área`);
+    loadAreas();
+  } catch(e) { toast('Error: ' + e.message, false); btn.disabled = false; }
+}
+
+function openChangeLeaderModal(slug, currentLeaderTgId) {
+  document.getElementById('change-leader-slug').value = slug;
+  document.getElementById('change-leader-select').innerHTML = teamCache.map(m =>
+    `<option value="${m.tg_id}" ${m.tg_id == currentLeaderTgId ? 'selected' : ''}>${m.name.split('(')[0].trim()} — ${(m.name.match(/\((.+)\)/)||['',''])[1]}</option>`
+  ).join('');
+  document.getElementById('change-leader-modal').classList.add('open');
+}
+
+async function submitChangeLeader() {
+  const slug         = document.getElementById('change-leader-slug').value;
+  const leader_tg_id = parseInt(document.getElementById('change-leader-select').value);
+  try {
+    await api('PUT', `/api/areas/${slug}/leader`, { leader_tg_id });
+    toast('✅ Líder actualizado');
+    closeModal('change-leader-modal');
+    loadAreas();
   } catch(e) { toast('Error: ' + e.message, false); }
 }
 

@@ -121,7 +121,9 @@ known_tasks: dict[str, set] = load_known_tasks()
     # Descripción opcional
     TASK_NOTES,
     SELF_TASK_NOTES,
-) = range(20)
+    # Área de trabajo (selección)
+    AREA_TASK_AREA,
+) = range(21)
 
 def get_members(team: dict) -> list:
     """Devuelve miembros del equipo sin el manager."""
@@ -330,6 +332,7 @@ async def crear_tarea_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await ask_assignee(update, context)
 
 async def ask_assignee(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from teams_manager import load_teams
     team    = load_team()
     members = get_members(team)
     task_name = context.user_data["new_task"]["name"]
@@ -344,6 +347,9 @@ async def ask_assignee(update: Update, context: ContextTypes.DEFAULT_TYPE):
             row = []
     if row:
         buttons.append(row)
+    # Botón de áreas si hay alguna configurada
+    if load_teams():
+        buttons.append([InlineKeyboardButton("🏢 Asignar a un área →", callback_data="assign_area_start")])
     buttons.append([InlineKeyboardButton("❌ Cancelar", callback_data="menu")])
 
     msg = f"➕ *Nueva tarea:*\n📌 _{task_name}_\n\n👤 ¿A quién se la asignas?"
@@ -363,6 +369,81 @@ async def handle_task_name_text(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data["new_task"] = {"name": task_name}
     context.user_data.pop("awaiting_task_name", None)
     return await ask_assignee(update, context)
+
+async def handle_area_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manager quiere asignar la tarea a un área. Muestra lista de áreas."""
+    from teams_manager import load_teams
+    query = update.callback_query
+    await query.answer()
+    areas = load_teams()
+    if not areas:
+        await query.edit_message_text(
+            "❌ No hay áreas configuradas. Créalas en el panel web.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Menú", callback_data="menu")]]),
+        )
+        return ConversationHandler.END
+
+    task_name = context.user_data["new_task"]["name"]
+    buttons = []
+    for slug, area in areas.items():
+        leader_first = get_first_name(area["leader_name"])
+        buttons.append([InlineKeyboardButton(
+            f"🏢 {area['name']} — Líder: {leader_first}",
+            callback_data=f"areasel_{slug}",
+        )])
+    buttons.append([InlineKeyboardButton("◀️ Volver", callback_data="crear_tarea_start")])
+    buttons.append([InlineKeyboardButton("❌ Cancelar", callback_data="menu")])
+
+    await query.edit_message_text(
+        f"🏢 *Asignar tarea a un área:*\n📌 _{task_name}_\n\n¿A cuál área?",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="Markdown",
+    )
+    return AREA_TASK_AREA
+
+
+async def handle_area_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manager seleccionó un área. El líder recibirá la notificación para asumir/delegar."""
+    from teams_manager import get_area
+    query = update.callback_query
+    await query.answer()
+    slug = query.data[len("areasel_"):]
+    area = get_area(slug)
+    if not area:
+        await query.edit_message_text("❌ Área no encontrada.")
+        return ConversationHandler.END
+
+    context.user_data["new_task"]["area_slug"]      = slug
+    context.user_data["new_task"]["area_name"]      = area["name"]
+    context.user_data["new_task"]["assignee_tg_id"] = area["leader_tg_id"]
+    context.user_data["new_task"]["assignee_gid"]   = area["leader_asana_gid"]
+    context.user_data["new_task"]["assignee_name"]  = area["leader_name"]
+
+    # Mostrar selector de fecha (igual que handle_assignee)
+    task_name = context.user_data["new_task"]["name"]
+    today    = datetime.now(TZ).date()
+    tomorrow = today + timedelta(days=1)
+    week_end = today + timedelta(days=(4 - today.weekday()) % 7 or 7)
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(f"Hoy ({today.strftime('%d/%m')})",       callback_data=f"due_{today}"),
+            InlineKeyboardButton(f"Mañana ({tomorrow.strftime('%d/%m')})", callback_data=f"due_{tomorrow}"),
+        ],
+        [
+            InlineKeyboardButton(f"Esta semana ({week_end.strftime('%d/%m')})", callback_data=f"due_{week_end}"),
+            InlineKeyboardButton("📅 Elegir fecha",                              callback_data="due_custom"),
+        ],
+        [InlineKeyboardButton("Sin fecha límite", callback_data="due_none")],
+        [InlineKeyboardButton("❌ Cancelar", callback_data="menu")],
+    ])
+    await query.edit_message_text(
+        f"🏢 *Área:* {area['name']}\n📌 _{task_name}_\n\n📅 ¿Cuándo vence?",
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+    )
+    return TASK_DUE
+
 
 async def handle_assignee(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -667,28 +748,57 @@ async def handle_task_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
     first_name     = get_first_name(task["assignee_name"])
     due_str        = due_label(due_on)
     freq_str       = freq_label(task) if freq else "única"
+    area_slug      = task.get("area_slug")
 
     try:
-        notif_msg = (
-            f"🔔 *¡Nueva tarea asignada, {first_name}!*\n\n"
-            f"📌 *{task['name']}*\n"
-            f"📅 Vence: {due_str}\n"
-            f"🔁 {freq_str}"
-        )
-        keyboard_notif = InlineKeyboardMarkup([[
-            InlineKeyboardButton("📋 Ver mis tareas", callback_data="ver_tareas")
-        ]])
-        await context.bot.send_message(
-            chat_id=assignee_tg_id, text=notif_msg,
-            reply_markup=keyboard_notif, parse_mode="Markdown")
+        if area_slug:
+            # ── Tarea asignada a un área: notificar al líder con opciones ────────
+            from teams_manager import get_area
+            area = get_area(area_slug)
+            if area:
+                deleg_buttons = [
+                    [InlineKeyboardButton("✅ Asumir yo", callback_data=f"asumir_{task_gid}")],
+                ]
+                for m in area.get("members", []):
+                    deleg_buttons.append([InlineKeyboardButton(
+                        f"🔀 Delegar a {get_first_name(m['name'])}",
+                        callback_data=f"delegar_exec_{task_gid}_{m['tg_id']}_{area_slug}",
+                    )])
+                deleg_buttons.append([InlineKeyboardButton("📋 Ver mis tareas", callback_data="ver_tareas")])
+                await context.bot.send_message(
+                    chat_id=assignee_tg_id,
+                    text=(
+                        f"🏢 *Nueva tarea para {area['name']}, {first_name}*\n\n"
+                        f"📌 *{task['name']}*\n"
+                        f"📅 Vence: {due_str}\n\n"
+                        f"¿La asumes tú o la delegas a alguien del área?"
+                    ),
+                    reply_markup=InlineKeyboardMarkup(deleg_buttons),
+                    parse_mode="Markdown",
+                )
+        else:
+            # ── Notificación estándar ─────────────────────────────────────────────
+            notif_msg = (
+                f"🔔 *¡Nueva tarea asignada, {first_name}!*\n\n"
+                f"📌 *{task['name']}*\n"
+                f"📅 Vence: {due_str}\n"
+                f"🔁 {freq_str}"
+            )
+            keyboard_notif = InlineKeyboardMarkup([[
+                InlineKeyboardButton("📋 Ver mis tareas", callback_data="ver_tareas")
+            ]])
+            await context.bot.send_message(
+                chat_id=assignee_tg_id, text=notif_msg,
+                reply_markup=keyboard_notif, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Error notificando a {assignee_tg_id}: {e}")
 
     freq_str_short = freq_label(task) if freq else "no se repite"
+    area_label = f"\n🏢 Área: {task['area_name']}" if task.get("area_name") else ""
     await query.edit_message_text(
         f"🎉 *¡Tarea creada exitosamente!*\n\n"
         f"📌 *{task['name']}*\n"
-        f"👤 {task['assignee_name']}\n"
+        f"👤 {task['assignee_name']}{area_label}\n"
         f"📅 {due_str}  |  🔁 {freq_str_short}\n\n"
         f"_{first_name} ya fue notificado/a._",
         parse_mode="Markdown",
@@ -1217,6 +1327,91 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "nl_task_cancel":
         context.user_data.pop("nl_task_draft", None)
         await show_main_menu(update, context, "❌ Tarea cancelada.")
+
+    # ── Delegación de tareas de área ──────────────────────────────────────────
+    elif data.startswith("asumir_"):
+        task_gid = data[len("asumir_"):]
+        # El líder decidió asumir la tarea (ya está asignada a él en Asana)
+        await query.edit_message_text(
+            f"✅ *Tarea asumida.*\nQueda en tu lista de pendientes.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📋 Ver mis tareas", callback_data="ver_tareas"),
+                InlineKeyboardButton("⬅️ Menú",           callback_data="menu"),
+            ]]),
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=MANAGER_CHAT_ID,
+                text=f"✅ El líder asumió la tarea del área (GID: {task_gid}).",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+
+    elif data.startswith("delegar_exec_"):
+        # "delegar_exec_{task_gid}_{member_tg_id}_{slug}"
+        payload = data[len("delegar_exec_"):]
+        parts   = payload.split("_", 2)  # max 2 splits → [task_gid, member_tg_id, slug]
+        if len(parts) < 3:
+            await query.edit_message_text("❌ Error en los datos de delegación.")
+            return
+        task_gid, member_tg_id_str, area_slug = parts
+        member_tg_id = int(member_tg_id_str)
+
+        from teams_manager import get_area
+        area = get_area(area_slug)
+        if not area:
+            await query.edit_message_text("❌ Área no encontrada.")
+            return
+
+        member_info = next(
+            (m for m in area.get("members", []) if m["tg_id"] == member_tg_id), None
+        )
+        if not member_info:
+            await query.edit_message_text("❌ Miembro no encontrado en el área.")
+            return
+
+        # Reasignar en Asana
+        try:
+            await asana_put(f"/tasks/{task_gid}", {"assignee": member_info["asana_gid"]})
+        except Exception as e:
+            logger.error(f"Error reasignando tarea {task_gid}: {e}")
+
+        # Agregar al tablero del miembro y al known_tasks
+        try:
+            await add_task_to_member_project(task_gid, member_info["asana_gid"], ASANA_TOKEN)
+        except Exception:
+            pass
+        known_tasks.setdefault(member_info["asana_gid"], set()).add(task_gid)
+        save_known_tasks()
+
+        # Notificar al miembro
+        member_first = get_first_name(member_info["name"])
+        try:
+            await context.bot.send_message(
+                chat_id=member_tg_id,
+                text=(
+                    f"🔀 *Tarea delegada, {member_first}*\n\n"
+                    f"Tu líder te asignó una tarea del área *{area['name']}*.\n\n"
+                    f"Revisa tus tareas pendientes."
+                ),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("📋 Ver mis tareas", callback_data="ver_tareas")
+                ]]),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.error(f"Error notificando a miembro delegado {member_tg_id}: {e}")
+
+        # Confirmar al líder
+        await query.edit_message_text(
+            f"✅ *Tarea delegada a {member_info['name']}.*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Menú", callback_data="menu")
+            ]]),
+        )
 
 # ── REPORTE ────────────────────────────────────────────────────────────────────
 
@@ -2932,8 +3127,12 @@ def main():
         ],
         states={
             TASK_ASSIGNEE: [
+                CallbackQueryHandler(handle_area_start,                  pattern="^assign_area_start$"),
                 CallbackQueryHandler(handle_assignee,                    pattern="^assign_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_task_name_text),
+            ],
+            AREA_TASK_AREA: [
+                CallbackQueryHandler(handle_area_select, pattern="^areasel_"),
             ],
             TASK_DUE: [
                 CallbackQueryHandler(handle_due, pattern="^due_"),
