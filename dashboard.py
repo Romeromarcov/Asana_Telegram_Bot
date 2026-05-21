@@ -401,7 +401,8 @@ async def delete_noncompliant(task_gid: str, _=Depends(check_auth)):
 async def api_gemini(_=Depends(check_auth)):
     from db import db_get
     active = db_get("gemini_model") or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-    has_key = bool(os.environ.get("GEMINI_API_KEY"))
+    # La API key está en el servicio Worker — leer estado desde DB (sincronizado al arrancar el bot)
+    has_key = bool(os.environ.get("GEMINI_API_KEY")) or bool(db_get("has_gemini_key"))
     return {
         "active_model": active,
         "has_api_key":  has_key,

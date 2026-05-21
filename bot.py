@@ -813,23 +813,24 @@ async def job_process_recurring(context: ContextTypes.DEFAULT_TYPE):
         if not should_create:
             continue
 
-        # Verificar si la tarea anterior está completada
+        # Notificar al manager si hay acumulación (sin bloquear la creación)
         pending_count = r.get("pending_count", 0)
         if pending_count >= 2:
-            # Escalar al manager
-            await context.bot.send_message(
-                chat_id=MANAGER_CHAT_ID,
-                text=(
-                    f"🚨 *Tarea recurrente bloqueada*\n\n"
-                    f"📌 *{r['task_name']}*\n"
-                    f"👤 {r['assignee_name']}\n"
-                    f"🔁 {freq_label(r)}\n\n"
-                    f"⚠️ *{pending_count} ocurrencias sin completar.*\n"
-                    f"No se creará una nueva hasta que se pongan al día."
-                ),
-                parse_mode="Markdown"
-            )
-            continue
+            try:
+                await context.bot.send_message(
+                    chat_id=MANAGER_CHAT_ID,
+                    text=(
+                        f"⚠️ *Tarea recurrente acumulada*\n\n"
+                        f"📌 *{r['task_name']}*\n"
+                        f"👤 {r['assignee_name']}\n"
+                        f"🔁 {freq_label(r)}\n\n"
+                        f"⚠️ *{pending_count} ocurrencias sin completar.*\n"
+                        f"Se sigue creando la nueva tarea."
+                    ),
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"Error notificando acumulación: {e}")
 
         # Crear nueva tarea en Asana
         try:
@@ -2696,8 +2697,10 @@ async def job_sunday_summary(context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     # Inicializar DB antes de arrancar el bot
-    from db import setup_db
+    from db import setup_db, db_set
     setup_db()
+    # Sincronizar estado de la API key de Gemini a la DB (lo lee el servicio Web)
+    db_set("has_gemini_key", bool(GEMINI_API_KEY))
 
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
