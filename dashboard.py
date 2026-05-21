@@ -195,6 +195,7 @@ async def api_recurring(_=Depends(check_auth)):
             "completed": completed, "this_week": this_week,
             "last_created": last_str,
             "paused": r.get("paused", False),
+            "notes": r.get("notes") or "",
             "status": (
                 "paused"    if r.get("paused")
                 else "completed" if completed
@@ -214,6 +215,7 @@ async def add_recurring(request: Request, _=Depends(check_auth)):
         raise HTTPException(400, "Responsable inválido")
     member = team[tg_id]
     freq   = body.get("freq", "weekly")
+    notes  = body.get("notes", "").strip() or None
     entry  = {
         "task_name":     body["task_name"].strip(),
         "assignee_gid":  member["asana_gid"],
@@ -225,6 +227,8 @@ async def add_recurring(request: Request, _=Depends(check_auth)):
         "last_created":  "",
         "pending_count": 0,
     }
+    if notes:
+        entry["notes"] = notes
     if freq == "weekly":
         entry["weekday"] = int(body.get("weekday", 0))
     elif freq == "intraday":
@@ -323,6 +327,8 @@ async def edit_recurring(idx: int, request: Request, _=Depends(check_auth)):
     r = data[idx]
     if "task_name" in body and body["task_name"].strip():
         r["task_name"] = body["task_name"].strip()
+    if "notes" in body:
+        r["notes"] = body["notes"].strip() or None
     if "weekday" in body:
         r["weekday"] = int(body["weekday"])
     if "freq" in body:
@@ -344,9 +350,38 @@ async def edit_recurring(idx: int, request: Request, _=Depends(check_auth)):
 # ── Recurring: reiniciar contador pendientes ───────────────────────────────────
 @app.post("/api/recurring/{idx}/reset")
 async def reset_recurring_count(idx: int, _=Depends(check_auth)):
+    from escalation import register_noncompliance
     data = load_recurring()
     if idx < 0 or idx >= len(data):
         raise HTTPException(404)
+    r             = data[idx]
+    pending_count = r.get("pending_count", 0)
+
+    # Registrar como no cumplida si había pendientes
+    if pending_count > 0:
+        last_task_gid = r.get("last_task_gid") or f"reset_{idx}_{r['task_name'][:20]}"
+        due_on        = r.get("due_on") or r.get("last_created") or ""
+        hours_overdue = 0.0
+        if due_on:
+            try:
+                from datetime import date as _date
+                due_d = datetime.strptime(due_on, "%Y-%m-%d").date()
+                hours_overdue = max(0.0, ((_date.today() - due_d).days) * 24.0)
+            except Exception:
+                pass
+        try:
+            register_noncompliance(
+                task_gid       = last_task_gid,
+                task_name      = r["task_name"],
+                assignee_name  = r.get("assignee_name", "—"),
+                assignee_tg_id = r.get("assignee_tg_id", 0),
+                due_on         = due_on or "—",
+                hours_overdue  = hours_overdue,
+                recurring_name = r.get("freq"),
+            )
+        except Exception as e:
+            logger.warning(f"No-cumplimiento al resetear: {e}")
+
     data[idx]["pending_count"] = 0
     save_recurring(data)
     return {"ok": True}
@@ -728,6 +763,10 @@ select.form-input{cursor:pointer}
         <label class="form-label">Hora de recordatorio</label>
         <input class="form-input" id="rec-hour" type="number" min="0" max="23" value="9" placeholder="9">
       </div>
+      <div>
+        <label class="form-label">Descripción (opcional)</label>
+        <textarea class="form-input" id="rec-notes" rows="3" placeholder="Contexto adicional para ejecutar la tarea..." style="resize:vertical"></textarea>
+      </div>
     </div>
     <div class="modal-footer">
       <button class="btn" onclick="closeModal('add-rec-modal')">Cancelar</button>
@@ -782,6 +821,10 @@ select.form-input{cursor:pointer}
       <div id="edit-rec-daily-field" style="display:none">
         <label class="form-label">Hora de recordatorio</label>
         <input class="form-input" id="edit-rec-hour" type="number" min="0" max="23" value="9" placeholder="9">
+      </div>
+      <div>
+        <label class="form-label">Descripción (opcional)</label>
+        <textarea class="form-input" id="edit-rec-notes" rows="3" placeholder="Contexto adicional para ejecutar la tarea..." style="resize:vertical"></textarea>
       </div>
     </div>
     <div class="modal-footer">
@@ -1014,7 +1057,8 @@ function openAddRecModal() {
   sel.innerHTML = teamCache.map(m =>
     `<option value="${m.tg_id}">${m.name.split('(')[0].trim()} — ${(m.name.match(/\((.+)\)/)||['',''])[1]}</option>`
   ).join('');
-  document.getElementById('rec-name').value = '';
+  document.getElementById('rec-name').value  = '';
+  document.getElementById('rec-notes').value = '';
   updateFreqFields();
   document.getElementById('add-rec-modal').classList.add('open');
 }
@@ -1030,9 +1074,11 @@ async function submitAddRec() {
   if (!name) { toast('Escribe el nombre de la tarea', false); return; }
   const tg_id = document.getElementById('rec-assignee').value;
   const freq  = document.getElementById('rec-freq').value;
+  const notes = document.getElementById('rec-notes').value.trim();
   const body  = { task_name:name, assignee_tg_id:tg_id, freq };
   if (freq==='weekly')  body.weekday = parseInt(document.getElementById('rec-weekday').value);
   if (freq==='intraday') body.hours  = [parseInt(document.getElementById('rec-hour').value)||9];
+  if (notes) body.notes = notes;
   try {
     await api('POST','/api/recurring/add', body);
     toast(`✅ "${name}" agregada`);
@@ -1079,8 +1125,9 @@ async function openEditRecModal(idx) {
   const r = data.find(x => x.idx === idx);
   if (!r) return;
 
-  document.getElementById('edit-rec-idx').value   = idx;
-  document.getElementById('edit-rec-name').value  = r.task_name;
+  document.getElementById('edit-rec-idx').value    = idx;
+  document.getElementById('edit-rec-name').value   = r.task_name;
+  document.getElementById('edit-rec-notes').value  = r.notes || '';
 
   // Populate assignee select
   const sel = document.getElementById('edit-rec-assignee');
@@ -1119,7 +1166,8 @@ async function submitEditRec() {
   const tg_id = document.getElementById('edit-rec-assignee').value;
   const freq  = document.getElementById('edit-rec-freq').value;
   if (!name) { toast('El nombre no puede estar vacío', false); return; }
-  const body = { task_name: name, assignee_tg_id: parseInt(tg_id), freq };
+  const editNotes = document.getElementById('edit-rec-notes').value.trim();
+  const body = { task_name: name, assignee_tg_id: parseInt(tg_id), freq, notes: editNotes };
   if (freq === 'weekly')   body.weekday = parseInt(document.getElementById('edit-rec-weekday').value);
   if (freq === 'intraday') body.hours   = [parseInt(document.getElementById('edit-rec-hour').value) || 9];
   try {

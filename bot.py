@@ -3,6 +3,7 @@ Bot de Telegram para seguimiento de tareas de Asana — Lubrikca
 Versión 3.0 — Botones interactivos + Crear tareas + Tareas recurrentes
 """
 
+import asyncio
 import os
 import json
 import logging
@@ -117,7 +118,10 @@ known_tasks: dict[str, set] = load_known_tasks()
     TEAM_ADD_NAME,
     TEAM_ADD_TGID,
     TEAM_ADD_ASANA,
-) = range(18)
+    # Descripción opcional
+    TASK_NOTES,
+    SELF_TASK_NOTES,
+) = range(20)
 
 def get_members(team: dict) -> list:
     """Devuelve miembros del equipo sin el manager."""
@@ -185,7 +189,7 @@ async def get_pending_tasks(asana_gid: str) -> list:
     return (await asana_get("/tasks", params)).get("data", [])
 
 async def create_asana_task(name: str, assignee_gid: str, due_on: str = None,
-                             recurrence: str = None) -> dict:
+                             recurrence: str = None, notes: str = None) -> dict:
     """Crea una tarea en Asana. recurrence: 'daily'|'weekly'|'monthly' para nativa."""
     data = {
         "name": name,
@@ -196,6 +200,8 @@ async def create_asana_task(name: str, assignee_gid: str, due_on: str = None,
         data["due_on"] = due_on
     if recurrence in ("daily", "weekly", "monthly"):
         data["recurrence"] = {"period": recurrence}
+    if notes:
+        data["notes"] = notes
     result = await asana_post("/tasks", data)
     return result.get("data", {})
 
@@ -566,17 +572,19 @@ async def confirm_and_create(update: Update, context: ContextTypes.DEFAULT_TYPE)
     name_str  = get_first_name(task["assignee_name"])
     freq_str  = freq_label(task) if freq else "única (no se repite)"
 
+    notes_preview = f"\n📝 _{task['notes'][:60]}_" if task.get("notes") else ""
     msg = (
         f"✅ *Confirmando tarea:*\n\n"
         f"📌 *{task['name']}*\n"
         f"👤 {task['assignee_name']}\n"
         f"📅 Vence: {due_str}\n"
-        f"🔁 {freq_str}\n\n"
+        f"🔁 {freq_str}{notes_preview}\n\n"
         f"¿Crear esta tarea?"
     )
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Sí, crear", callback_data="task_confirm_yes")],
-        [InlineKeyboardButton("❌ Cancelar",  callback_data="menu")],
+        [InlineKeyboardButton("✅ Sí, crear",         callback_data="task_confirm_yes")],
+        [InlineKeyboardButton("✏️ Agregar descripción", callback_data="task_add_desc")],
+        [InlineKeyboardButton("❌ Cancelar",            callback_data="menu")],
     ])
 
     if update.callback_query:
@@ -595,6 +603,7 @@ async def handle_task_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     freq    = task.get("freq")
     due_on  = task.get("due_on")
+    notes   = task.get("notes")
 
     # Recurrencia nativa de Asana para daily/weekly/monthly
     asana_recurrence = None
@@ -609,6 +618,7 @@ async def handle_task_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
             assignee_gid = task["assignee_gid"],
             due_on       = due_on,
             recurrence   = asana_recurrence,
+            notes        = notes,
         )
         task_gid = created.get("gid", "")
     except Exception as e:
@@ -686,6 +696,91 @@ async def handle_task_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
             InlineKeyboardButton("➕ Crear otra tarea", callback_data="crear_tarea_start"),
             InlineKeyboardButton("⬅️ Menú",             callback_data="menu"),
         ]])
+    )
+    context.user_data.pop("new_task", None)
+    return ConversationHandler.END
+
+async def handle_task_add_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """El manager quiere agregar descripción antes de crear la tarea."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "✏️ *Escribe la descripción de la tarea:*\n"
+        "_(O escribe /skip para crear sin descripción)_",
+        parse_mode="Markdown",
+    )
+    return TASK_NOTES
+
+async def handle_task_notes_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Recibe la descripción y crea la tarea."""
+    text = update.message.text.strip()
+    if text.lower() != "/skip":
+        context.user_data.setdefault("new_task", {})["notes"] = text
+    # Simular task_confirm_yes en modo mensaje
+    task = context.user_data.get("new_task", {})
+    if not task:
+        await update.message.reply_text("❌ No hay tarea pendiente.")
+        return ConversationHandler.END
+    freq   = task.get("freq")
+    due_on = task.get("due_on")
+    notes  = task.get("notes")
+    asana_recurrence = None
+    if freq == "daily":
+        asana_recurrence = "daily"
+    elif freq == "monthly":
+        asana_recurrence = "monthly"
+    try:
+        created  = await create_asana_task(task["name"], task["assignee_gid"], due_on,
+                                            asana_recurrence, notes)
+        task_gid = created.get("gid", "")
+    except Exception as e:
+        logger.error(f"Error creando tarea (con descripción): {e}")
+        await update.message.reply_text("❌ Error al crear la tarea en Asana.")
+        return ConversationHandler.END
+    # Marcar como conocida + agregar al tablero
+    agid = task["assignee_gid"]
+    known_tasks.setdefault(agid, set()).add(task_gid)
+    save_known_tasks()
+    try:
+        await add_task_to_member_project(task_gid, agid, ASANA_TOKEN)
+    except Exception:
+        pass
+    today_str = datetime.now(TZ).strftime("%Y-%m-%d")
+    if not freq and due_on and task_gid:
+        register_unique_task(task_gid, today_str, due_on)
+    if freq in ("intraday", "weekly", "biweekly"):
+        rec_config = {
+            "task_name": task["name"], "assignee_gid": agid,
+            "assignee_tg_id": task["assignee_tg_id"], "assignee_name": task["assignee_name"],
+            "freq": freq, "weekday": task.get("weekday"), "times_per_day": task.get("times_per_day"),
+            "hours": task.get("hours", []), "due_on": due_on, "last_task_gid": task_gid,
+            "last_created": datetime.now(TZ).strftime("%Y-%m-%d"), "pending_count": 1,
+        }
+        add_recurring(rec_config)
+    # Notificar al responsable
+    first_name = get_first_name(task["assignee_name"])
+    try:
+        await context.bot.send_message(
+            chat_id=task["assignee_tg_id"],
+            text=(f"🔔 *¡Nueva tarea asignada, {first_name}!*\n\n"
+                  f"📌 *{task['name']}*\n"
+                  f"📅 Vence: {due_label(due_on)}\n"
+                  f"🔁 {freq_label(task) if freq else 'única'}"),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📋 Ver mis tareas", callback_data="ver_tareas")
+            ]]),
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
+    await update.message.reply_text(
+        f"🎉 *¡Tarea creada!*\n\n📌 *{task['name']}*\n👤 {task['assignee_name']}\n"
+        f"📅 {due_label(due_on)}" + (f"\n📝 _{notes[:60]}_" if notes else ""),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("➕ Crear otra tarea", callback_data="crear_tarea_start"),
+            InlineKeyboardButton("⬅️ Menú",             callback_data="menu"),
+        ]]),
     )
     context.user_data.pop("new_task", None)
     return ConversationHandler.END
@@ -1333,7 +1428,7 @@ async def self_task_due(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     due_on = None if data == "sdue_none" else data[5:]
     context.user_data["self_task"]["due_on"] = due_on
-    return await self_task_create(update, context)
+    return await self_task_ask_notes(update, context)
 
 async def self_task_due_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
@@ -1345,6 +1440,39 @@ async def self_task_due_custom(update: Update, context: ContextTypes.DEFAULT_TYP
             "❌ Formato inválido. Escribe: `25/04/2026`", parse_mode="Markdown"
         )
         return SELF_TASK_DUE_CUSTOM
+    return await self_task_ask_notes(update, context)
+
+async def self_task_ask_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Pregunta opcionalmente por una descripción antes de crear la tarea propia."""
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Crear sin descripción", callback_data="sself_skip_notes")],
+        [InlineKeyboardButton("✏️ Agregar descripción",  callback_data="sself_add_notes")],
+        [InlineKeyboardButton("❌ Cancelar",              callback_data="menu")],
+    ])
+    task = context.user_data["self_task"]
+    msg = (f"📝 *{task['name']}*\n📅 {due_label(task.get('due_on'))}\n\n"
+           "¿Quieres agregar una descripción?")
+    if update.callback_query:
+        await update.callback_query.edit_message_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+    return SELF_TASK_NOTES
+
+async def self_task_notes_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "sself_skip_notes":
+        return await self_task_create(update, context)
+    await query.edit_message_text(
+        "✏️ *Escribe la descripción:*\n_(O /skip para continuar sin descripción)_",
+        parse_mode="Markdown"
+    )
+    return SELF_TASK_NOTES
+
+async def self_task_notes_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text.lower() != "/skip":
+        context.user_data["self_task"]["notes"] = text
     return await self_task_create(update, context)
 
 async def self_task_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1355,7 +1483,8 @@ async def self_task_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
     due_on = task.get("due_on")
 
     try:
-        created  = await create_asana_task(task["name"], info["asana_gid"], due_on)
+        created  = await create_asana_task(task["name"], info["asana_gid"], due_on,
+                                            notes=task.get("notes"))
         task_gid = created.get("gid", "")
     except Exception as e:
         logger.error(f"Error creando tarea propia: {e}")
@@ -2242,6 +2371,77 @@ async def team_add_confirm_handler(update: Update, context: ContextTypes.DEFAULT
 
 # ── POST-INIT: crea proyectos Asana para todos los miembros al arrancar ────────
 
+async def _register_existing_tasks_to_boards() -> tuple[int, int]:
+    """
+    Registra todas las tareas pendientes de Asana en el tablero "📌 Pendiente"
+    de cada miembro del equipo. Se ejecuta una sola vez al primer despliegue.
+    Devuelve (agregadas, omitidas).
+    """
+    from asana_projects import load_projects
+    team     = load_team()
+    projects = load_projects()
+    headers  = {"Authorization": f"Bearer {ASANA_TOKEN}"}
+    added    = 0
+    skipped  = 0
+
+    for tg_id, info in team.items():
+        if tg_id == MANAGER_CHAT_ID:
+            continue
+        asana_gid   = info["asana_gid"]
+        project_cfg = projects.get(asana_gid)
+        if not project_cfg:
+            continue
+        project_gid = project_cfg.get("project_gid")
+        section_gid = project_cfg.get("sections", {}).get("📌 Pendiente")
+        if not project_gid or not section_gid:
+            continue
+
+        # Obtener tareas pendientes del miembro
+        try:
+            r = await http_client.get(
+                f"{ASANA_BASE}/tasks",
+                headers=headers,
+                params={
+                    "assignee": asana_gid, "workspace": ASANA_WORKSPACE,
+                    "completed_since": "now",
+                    "opt_fields": "gid,name,memberships.project.gid",
+                    "limit": 100,
+                },
+                timeout=20,
+            )
+            r.raise_for_status()
+            tasks = r.json().get("data", [])
+        except Exception as e:
+            logger.error(f"Error obteniendo tareas de {info['name']}: {e}")
+            continue
+
+        for task in tasks:
+            task_gid = task["gid"]
+            # Verificar si la tarea ya está en el proyecto del tablero
+            existing_projects = {
+                m["project"]["gid"]
+                for m in task.get("memberships", [])
+                if m.get("project")
+            }
+            if project_gid in existing_projects:
+                skipped += 1
+                continue
+            try:
+                r2 = await http_client.post(
+                    f"{ASANA_BASE}/sections/{section_gid}/addTask",
+                    headers={**headers, "Content-Type": "application/json"},
+                    json={"data": {"task": task_gid}},
+                    timeout=15,
+                )
+                r2.raise_for_status()
+                added += 1
+                await asyncio.sleep(0.25)
+            except Exception as e:
+                logger.warning(f"No se pudo registrar tarea {task_gid}: {e}")
+
+    return added, skipped
+
+
 async def post_init(application: Application) -> None:
     """Crea (o verifica) el proyecto Kanban en Asana de cada miembro del equipo."""
     if not ASANA_TOKEN or not ASANA_WORKSPACE:
@@ -2258,6 +2458,17 @@ async def post_init(application: Application) -> None:
             logger.info(f"✅ Proyecto Asana asegurado para {info['name']}")
         except Exception as e:
             logger.error(f"Error creando proyecto para {info['name']}: {e}")
+
+    # ── Registro único de tareas existentes en tableros ────────────────────────
+    from db import db_get, db_set
+    if not db_get("boards_registered"):
+        logger.info("📋 Primera vez — registrando tareas existentes en tableros Kanban...")
+        try:
+            added, skipped = await _register_existing_tasks_to_boards()
+            logger.info(f"✅ Tableros: {added} registradas, {skipped} ya existían")
+            db_set("boards_registered", True)
+        except Exception as e:
+            logger.error(f"Error en registro inicial de tableros: {e}")
 
 # ── MAIN ───────────────────────────────────────────────────────────────────────
 
@@ -2586,7 +2797,7 @@ async def job_escalation(context: ContextTypes.DEFAULT_TYPE, session: str = "pm"
                     reply_markup=keyboard_mgr, parse_mode="Markdown")
                 mark_alert_sent(gid, esc_key, state=alert_state)   # sin I/O
                 if register_nc:
-                    # Registrar en tabla de no-cumplimiento (no bloquea la recurrencia)
+                    # Registrar en tabla de no-cumplimiento y decrementar pending_count
                     rec_data_local = load_recurring()
                     rec_name = get_freq_for_task(gid, rec_data_local)
                     register_noncompliance(
@@ -2598,6 +2809,15 @@ async def job_escalation(context: ContextTypes.DEFAULT_TYPE, session: str = "pm"
                         hours_overdue=hours,
                         recurring_name=rec_name,
                     )
+                    # Decrementar pending_count de la recurrente correspondiente
+                    rec_changed = False
+                    for entry in rec_data_local:
+                        if entry.get("last_task_gid") == gid and entry.get("pending_count", 0) > 0:
+                            entry["pending_count"] = max(0, entry["pending_count"] - 1)
+                            rec_changed = True
+                            break
+                    if rec_changed:
+                        save_recurring(rec_data_local)
                 logger.info(f"Escalación '{esc_key}' → manager: {info['name']} / {task['name']}")
             except Exception as e:
                 logger.error(f"Error escalación: {e}")
@@ -2724,6 +2944,10 @@ def main():
             TASK_RECURRING: [
                 CallbackQueryHandler(handle_recurring_choice, pattern="^rec_(yes|no)$"),
                 CallbackQueryHandler(handle_task_confirm,     pattern="^task_confirm_yes$"),
+                CallbackQueryHandler(handle_task_add_desc,    pattern="^task_add_desc$"),
+            ],
+            TASK_NOTES: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_task_notes_input),
             ],
             TASK_FREQ: [
                 CallbackQueryHandler(handle_freq, pattern="^freq_"),
@@ -2757,6 +2981,10 @@ def main():
             ],
             SELF_TASK_DUE_CUSTOM: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, self_task_due_custom),
+            ],
+            SELF_TASK_NOTES: [
+                CallbackQueryHandler(self_task_notes_choice, pattern="^sself_(skip|add)_notes$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, self_task_notes_input),
             ],
         },
         fallbacks=[
