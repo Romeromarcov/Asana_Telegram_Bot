@@ -463,17 +463,24 @@ async def save_gemini_model(request: Request, _=Depends(check_auth)):
 # ÁREAS DE TRABAJO
 # ══════════════════════════════════════════════════════════════════════════════
 
+@app.get("/api/db-status")
+async def api_db_status(_=Depends(check_auth)):
+    from db import db_connected
+    return {"connected": db_connected()}
+
 @app.get("/api/areas")
 async def api_areas(_=Depends(check_auth)):
     from teams_manager import load_teams
     teams = load_teams()
     result = []
     for slug, t in teams.items():
+        if not isinstance(t, dict):
+            continue
         result.append({
             "slug":         slug,
-            "name":         t["name"],
-            "leader_name":  t["leader_name"],
-            "leader_tg_id": t["leader_tg_id"],
+            "name":         t.get("name", slug),
+            "leader_name":  t.get("leader_name", "—"),
+            "leader_tg_id": t.get("leader_tg_id", 0),
             "members":      t.get("members", []),
         })
     return result
@@ -772,13 +779,16 @@ select.form-input{cursor:pointer}
 
 <!-- ═══ DASHBOARD ═══ -->
 <div id="tab-dashboard" class="tab-content active">
+  <div id="db-warning" style="display:none;background:#FEF3C7;border:1px solid #F59E0B;border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#92400E">
+    ⚠️ <strong>Sin conexión a la base de datos (PostgreSQL).</strong> Los datos se guardan solo en memoria local y se perderán al reiniciar. Verifica que <code>DATABASE_URL</code> esté configurada en el servicio Web de Railway.
+  </div>
   <div class="page-header">
     <div><div class="page-title">Dashboard</div>
     <div class="page-sub" id="dash-ts">Cargando desde Asana...</div></div>
     <button class="btn" onclick="loadDashboard()">↻ Actualizar</button>
   </div>
   <div id="dash-cards" class="summary-grid"><div class="loader"><span class="spin">⟳</span></div></div>
-  <div class="section-title">📋 Tareas por persona</div>
+  <div class="section-title" id="dash-tasks-title">📋 Tareas por área</div>
   <div id="dash-tasks"><div class="loader"><span class="spin">⟳</span></div></div>
 </div>
 
@@ -825,7 +835,7 @@ select.form-input{cursor:pointer}
       <button class="btn btn-primary" onclick="openAddAreaModal()">+ Nueva área</button>
     </div>
   </div>
-  <div id="areas-body"><div class="loader"><span class="spin">⟳</span></div></div>
+  <div id="areas-body"><p class="empty-msg">Haz clic en ↻ Actualizar o selecciona esta pestaña para cargar las áreas.</p></div>
 </div>
 
 <!-- ═══ NO CUMPLIDAS ═══ -->
@@ -1124,19 +1134,65 @@ function avt(initials, color, size=36, fs=12) {
 }
 
 /* ══════════ DASHBOARD ══════════ */
+function _personBlock(p) {
+  const rows = p.tasks.map(t => {
+    const od = t.due_on && t.due_on < TODAY;
+    return `<div class="task-row" id="tr-${t.gid}">
+      <span class="task-name">${t.name}</span>
+      <span class="task-due${od?' overdue':''}">${fmt(t.due_on)}</span>
+      ${t.permalink_url?`<a class="task-link" href="${t.permalink_url}" target="_blank">↗</a>`:''}
+      <button class="btn btn-sm btn-success" onclick="completarTarea('${t.gid}',this)" title="Marcar completada">✓</button>
+      <button class="btn btn-sm btn-danger" onclick="eliminarTarea('${t.gid}','${t.name.replace(/'/g,'')}',this)" title="Eliminar">🗑</button>
+    </div>`;
+  }).join('');
+  return `<div class="person-block">
+    <div class="person-header" style="border-color:${p.color}25">
+      ${avt(p.initials,p.color,28,11)}
+      <span style="font-size:15px;font-weight:600">${p.name.split('(')[0].trim()}</span>
+      <span style="margin-left:auto;font-size:12px;color:var(--text3)">${p.total} tarea${p.total!==1?'s':''}</span>
+    </div>
+    <div class="task-list">${rows||'<div class="empty-msg">✅ Sin tareas pendientes</div>'}</div>
+  </div>`;
+}
+
+function _areaHeader(name, emoji, totalTasks) {
+  return `<div style="display:flex;align-items:center;gap:8px;margin:20px 0 8px;padding-bottom:6px;border-bottom:2px solid var(--border)">
+    <span style="font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--text2)">${emoji} ${name}</span>
+    <span style="font-size:11px;color:var(--text3);margin-left:4px">${totalTasks} tarea${totalTasks!==1?'s':''}</span>
+  </div>`;
+}
+
 async function loadDashboard() {
   document.getElementById('dash-cards').innerHTML = '<div class="loader"><span class="spin">⟳</span></div>';
   document.getElementById('dash-tasks').innerHTML = '<div class="loader"><span class="spin">⟳</span></div>';
   document.getElementById('dash-ts').textContent  = 'Actualizando...';
   try {
-    const data = await api('GET','/api/summary');
-    // Cards
+    // Check DB status (don't block dashboard load)
+    api('GET', '/api/db-status').then(s => {
+      const w = document.getElementById('db-warning');
+      if (w) w.style.display = s.connected ? 'none' : 'block';
+    }).catch(() => {});
+
+    // Fetch data + areas in parallel
+    const [data, areas] = await Promise.all([
+      api('GET', '/api/summary'),
+      api('GET', '/api/areas').catch(() => [])
+    ]);
+
+    // Build tg_id → area map (leader + members)
+    const tgToArea = {};
+    for (const a of areas) {
+      tgToArea[String(a.leader_tg_id)] = a.name;
+      for (const m of a.members) tgToArea[String(m.tg_id)] = a.name;
+    }
+
+    // Cards — keep sorted by overdue/total, show area name from map
     const cards = data.map(p => {
-      const area = (p.name.match(/\((.+)\)/) || ['',''])[1];
+      const areaName = tgToArea[String(p.tg_id)] || (p.name.match(/\((.+)\)/) || ['',''])[1];
       return `<div class="card">
         <div class="card-top">${avt(p.initials,p.color)}
           <div><div class="card-name">${p.name.split('(')[0].trim()}</div>
-          <div class="card-area">${area}</div></div>
+          <div class="card-area">${areaName}</div></div>
         </div>
         <div class="card-count">${p.total}</div>
         <div class="card-label">tarea${p.total!==1?'s':''} pendiente${p.total!==1?'s':''}</div>
@@ -1144,33 +1200,41 @@ async function loadDashboard() {
       </div>`;
     }).join('');
     document.getElementById('dash-cards').innerHTML = cards || '<p class="empty-msg">Sin datos</p>';
-    // Task blocks
-    const blocks = data.map(p => {
-      const area = (p.name.match(/\((.+)\)/) || ['',''])[1];
-      const rows = p.tasks.map(t => {
-        const od = t.due_on && t.due_on < TODAY;
-        return `<div class="task-row" id="tr-${t.gid}">
-          <span class="task-name">${t.name}</span>
-          <span class="task-due${od?' overdue':''}">${fmt(t.due_on)}</span>
-          ${t.permalink_url?`<a class="task-link" href="${t.permalink_url}" target="_blank">↗</a>`:''}
-          <button class="btn btn-sm btn-success" onclick="completarTarea('${t.gid}',this)" title="Marcar completada">✓</button>
-          <button class="btn btn-sm btn-danger" onclick="eliminarTarea('${t.gid}','${t.name.replace(/'/g,'')}',this)" title="Eliminar tarea">🗑</button>
-        </div>`;
-      }).join('');
-      return `<div class="person-block">
-        <div class="person-header" style="border-color:${p.color}25">
-          ${avt(p.initials,p.color,28,11)}
-          <span style="font-size:15px;font-weight:600">${p.name.split('(')[0].trim()}</span>
-          ${area?`<span style="font-size:12px;color:var(--text2)">${area}</span>`:''}
-          <span style="margin-left:auto;font-size:12px;color:var(--text3)">${p.total} tarea${p.total!==1?'s':''}</span>
-        </div>
-        <div class="task-list">${rows||'<div class="empty-msg">✅ Sin tareas pendientes</div>'}</div>
-      </div>`;
-    }).join('');
-    document.getElementById('dash-tasks').innerHTML = blocks || '<p class="empty-msg">No hay datos.</p>';
+
+    // Task blocks — grouped by area
+    let html = '';
+    if (areas.length > 0) {
+      const grouped = {};
+      const ungrouped = [];
+      for (const p of data) {
+        const aName = tgToArea[String(p.tg_id)];
+        if (aName) { (grouped[aName] = grouped[aName] || []).push(p); }
+        else ungrouped.push(p);
+      }
+      for (const a of areas) {
+        const people = grouped[a.name] || [];
+        if (!people.length) continue;
+        const tot = people.reduce((s,p) => s + p.total, 0);
+        html += _areaHeader(a.name, '🏢', tot);
+        html += people.map(_personBlock).join('');
+      }
+      if (ungrouped.length) {
+        const tot = ungrouped.reduce((s,p) => s + p.total, 0);
+        html += _areaHeader('Sin área asignada', '📋', tot);
+        html += ungrouped.map(_personBlock).join('');
+      }
+    } else {
+      // No areas defined — flat list
+      html = data.map(_personBlock).join('');
+      const tt = document.getElementById('dash-tasks-title');
+      if (tt) tt.textContent = '📋 Tareas por persona';
+    }
+
+    document.getElementById('dash-tasks').innerHTML = html || '<p class="empty-msg">No hay datos.</p>';
     document.getElementById('dash-ts').textContent = 'Actualizado: ' + new Date().toLocaleTimeString('es',{hour:'2-digit',minute:'2-digit'});
   } catch(e) {
     document.getElementById('dash-cards').innerHTML = `<p style="color:#B91C1C">Error: ${e.message}</p>`;
+    document.getElementById('dash-tasks').innerHTML = '';
   }
 }
 

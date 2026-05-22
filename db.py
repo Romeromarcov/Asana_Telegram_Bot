@@ -96,6 +96,7 @@ def _seed_from_files(conn):
         "team":      _load_team_from_file(base),
         "recurring": _load_json_file(base / "recurring.json", []),
         "projects":  _load_json_file(base / "projects.json",  {}),
+        "teams":     _load_json_file(base / "teams.json",     {}),  # áreas de trabajo
     }
 
     for key, value in seeds.items():
@@ -209,3 +210,8 @@ def db_has(key: str) -> bool:
             return cur.fetchone() is not None
     except Exception:
         return False
+
+
+def db_connected() -> bool:
+    """Devuelve True si hay conexión activa a PostgreSQL."""
+    return _get_conn() is not None
