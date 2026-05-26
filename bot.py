@@ -322,6 +322,19 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
     else:
         await update.message.reply_text(greeting, reply_markup=keyboard, parse_mode="Markdown")
 
+_CONV_KEYS = (
+    "new_task", "awaiting_task_name", "leader_mode", "leader_area_data",
+    "self_task", "nl_task_draft", "nl_awaiting_date",
+    "awaiting_comment_for", "awaiting_comment_name",
+)
+
+async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancela cualquier conversación activa y limpia el estado."""
+    for key in _CONV_KEYS:
+        context.user_data.pop(key, None)
+    await show_main_menu(update, context, "❌ Operación cancelada.")
+    return ConversationHandler.END
+
 # ══════════════════════════════════════════════════════════════════════════════
 # FLUJO DE CREACIÓN DE TAREA
 # ══════════════════════════════════════════════════════════════════════════════
@@ -413,11 +426,17 @@ async def ask_assignee(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return TASK_ASSIGNEE
 
 async def handle_task_name_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recibe el nombre de la tarea cuando se escribe en chat."""
-    if not context.user_data.get("awaiting_task_name"):
-        return ConversationHandler.END
+    """Recibe el nombre de la tarea cuando se escribe en chat (estado TASK_ASSIGNEE)."""
+    # Si el task ya tiene nombre (estamos en la pantalla de selección de responsable),
+    # ignorar el texto y pedir que usen los botones.
+    if context.user_data.get("new_task", {}).get("name"):
+        await update.message.reply_text(
+            "⚠️ Usa los botones para seleccionar el responsable, o /menu para cancelar.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="menu")]]),
+        )
+        return TASK_ASSIGNEE
     task_name = update.message.text.strip()
-    context.user_data["new_task"] = {"name": task_name}
+    context.user_data.setdefault("new_task", {})["name"] = task_name
     context.user_data.pop("awaiting_task_name", None)
     return await ask_assignee(update, context)
 
@@ -1673,6 +1692,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("nl_due_"):
         await nl_due_handler(update, context)
 
+    elif data == "nl_change_assignee":
+        await nl_change_assignee_handler(update, context)
+
+    elif data == "nl_change_due":
+        await nl_change_due_handler(update, context)
+
+    elif data == "nl_area_start":
+        await nl_area_start_handler(update, context)
+
+    elif data.startswith("nl_area_"):
+        await nl_area_select_handler(update, context)
+
+    elif data == "nl_back_draft":
+        await _show_nl_draft(update, context)
+
     elif data == "nl_task_cancel":
         context.user_data.pop("nl_task_draft", None)
         await show_main_menu(update, context, "❌ Tarea cancelada.")
@@ -2384,6 +2418,20 @@ async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
     team  = load_team()
 
+    # ── 0. Guard: si el usuario está en medio de un flujo de menú, no activar IA ─
+    if context.user_data.get("awaiting_task_name"):
+        await update.message.reply_text(
+            "⚠️ Estás creando una tarea. Escribe el *nombre de la tarea* o usa /menu para cancelar.",
+            parse_mode="Markdown",
+        )
+        return
+    if context.user_data.get("new_task") and not context.user_data.get("nl_task_draft"):
+        await update.message.reply_text(
+            "⚠️ Usa los botones para continuar con la tarea en curso, o /menu para cancelar.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data="menu")]]),
+        )
+        return
+
     # ── 1. Comentario pendiente ────────────────────────────────────────────────
     task_gid   = context.user_data.pop("awaiting_comment_for", None)
     task_name  = context.user_data.pop("awaiting_comment_name", "")
@@ -2490,12 +2538,15 @@ async def _show_nl_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task_name = draft.get("task_name", "Sin nombre")
     assignee  = draft.get("assignee_name")
     due_on    = draft.get("due_on")
+    area_name = draft.get("area_name")
     extra     = draft.get("_extra_count", 0)
 
-    who  = assignee or "❓ Sin responsable"
+    who  = assignee.split("(")[0].strip() if assignee else "❓ Sin responsable"
     when = due_label(due_on) if due_on else "❓ Sin fecha"
 
     msg = f"🤖 *Tarea detectada:*\n\n📌 *{task_name}*\n👤 {who}  |  📅 {when}"
+    if area_name:
+        msg += f"\n🏢 {area_name}"
     if extra:
         msg += f"\n\n_+ {extra} tarea(s) más detectada(s) — créalas desde el menú._"
 
@@ -2515,6 +2566,7 @@ async def _show_nl_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 row = []
         if row:
             buttons.append(row)
+        buttons.append([InlineKeyboardButton("❌ Cancelar", callback_data="nl_task_cancel")])
 
     # Si falta la fecha → mostrar selector
     elif not due_on:
@@ -2532,18 +2584,25 @@ async def _show_nl_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("📅 Otra fecha",                                callback_data="nl_due_custom"),
             ],
             [InlineKeyboardButton("Sin fecha", callback_data="nl_due_none")],
+            [
+                InlineKeyboardButton("👤 Cambiar responsable", callback_data="nl_change_assignee"),
+                InlineKeyboardButton("❌ Cancelar",            callback_data="nl_task_cancel"),
+            ],
         ]
 
-    # Todo completo → confirmar
+    # Todo completo → confirmar con opciones de cambio y área
     else:
         buttons = [
+            [InlineKeyboardButton("✅ Crear tarea", callback_data="nl_task_confirm")],
             [
-                InlineKeyboardButton("✅ Crear tarea", callback_data="nl_task_confirm"),
-                InlineKeyboardButton("❌ Cancelar",    callback_data="nl_task_cancel"),
-            ]
+                InlineKeyboardButton("👤 Cambiar responsable", callback_data="nl_change_assignee"),
+                InlineKeyboardButton("📅 Cambiar fecha",       callback_data="nl_change_due"),
+            ],
+            [InlineKeyboardButton("🏢 Asignar a área", callback_data="nl_area_start")],
+            [InlineKeyboardButton("❌ Cancelar", callback_data="nl_task_cancel")],
         ]
 
-    keyboard = InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("❌ Cancelar", callback_data="nl_task_cancel")]])
+    keyboard = InlineKeyboardMarkup(buttons)
 
     if update.callback_query:
         await update.callback_query.edit_message_text(msg, reply_markup=keyboard, parse_mode="Markdown")
@@ -2584,6 +2643,63 @@ async def nl_due_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["nl_task_draft"] = draft
     await _show_nl_draft(update, context)
 
+async def nl_change_assignee_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Limpia el responsable del draft NL y muestra el selector."""
+    query = update.callback_query
+    await query.answer()
+    draft = context.user_data.get("nl_task_draft", {})
+    for k in ("assignee_tg_id", "assignee_gid", "assignee_name"):
+        draft.pop(k, None)
+    context.user_data["nl_task_draft"] = draft
+    await _show_nl_draft(update, context)
+
+async def nl_change_due_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Limpia la fecha del draft NL y muestra el selector."""
+    query = update.callback_query
+    await query.answer()
+    draft = context.user_data.get("nl_task_draft", {})
+    draft.pop("due_on", None)
+    context.user_data["nl_task_draft"] = draft
+    await _show_nl_draft(update, context)
+
+async def nl_area_start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra lista de áreas para asignar la tarea NL."""
+    query = update.callback_query
+    await query.answer()
+    from teams_manager import load_teams
+    teams = load_teams()
+    if not teams:
+        await query.answer("No hay áreas configuradas.", show_alert=True)
+        return
+    buttons = [[InlineKeyboardButton(f"🏢 {a['name']}", callback_data=f"nl_area_{slug}")]
+               for slug, a in teams.items()]
+    buttons.append([InlineKeyboardButton("🚫 Sin área", callback_data="nl_area_none")])
+    buttons.append([InlineKeyboardButton("◀️ Volver", callback_data="nl_back_draft")])
+    await query.edit_message_text(
+        "🏢 *¿A qué área pertenece esta tarea?*",
+        reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown",
+    )
+
+async def nl_area_select_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Asigna área al draft NL y vuelve al borrador."""
+    query = update.callback_query
+    await query.answer()
+    slug = query.data[len("nl_area_"):]
+    draft = context.user_data.get("nl_task_draft", {})
+    if slug == "none":
+        draft.pop("area_slug", None)
+        draft.pop("area_name", None)
+        draft.pop("area_leader_tg_id", None)
+    else:
+        from teams_manager import get_area
+        area = get_area(slug)
+        if area:
+            draft["area_slug"]         = slug
+            draft["area_name"]         = area["name"]
+            draft["area_leader_tg_id"] = area.get("leader_tg_id")
+    context.user_data["nl_task_draft"] = draft
+    await _show_nl_draft(update, context)
+
 async def nl_task_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -2618,17 +2734,35 @@ async def nl_task_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if draft.get("due_on") and task_gid:
         register_unique_task(task_gid, today_str, draft["due_on"])
 
+    # Registrar como tarea de área si aplica
+    if draft.get("area_slug") and task_gid:
+        from teams_manager import register_area_task
+        try:
+            register_area_task(
+                task_gid=task_gid,
+                task_name=draft["task_name"],
+                area_slug=draft["area_slug"],
+                area_name=draft["area_name"],
+                assigned_to_tg_id=draft["assignee_tg_id"],
+                assigned_to_name=draft["assignee_name"],
+                leader_tg_id=draft.get("area_leader_tg_id", MANAGER_CHAT_ID),
+                due_on=draft.get("due_on"),
+            )
+        except Exception as e:
+            logger.warning(f"No se pudo registrar tarea de área NL: {e}")
+
     first_name = get_first_name(draft["assignee_name"])
     due_str    = due_label(draft.get("due_on"))
 
     # Notificar al responsable
     try:
+        area_line = f"\n🏢 {draft['area_name']}" if draft.get("area_name") else ""
         await context.bot.send_message(
             chat_id=draft["assignee_tg_id"],
             text=(
                 f"🔔 *¡Nueva tarea, {first_name}!*\n\n"
                 f"📌 *{draft['task_name']}*\n"
-                f"📅 Vence: {due_str}"
+                f"📅 Vence: {due_str}{area_line}"
             ),
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("📋 Ver mis tareas", callback_data="ver_tareas")
@@ -2638,8 +2772,9 @@ async def nl_task_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+    area_info = f"\n🏢 {draft['area_name']}" if draft.get("area_name") else ""
     await query.edit_message_text(
-        f"🎉 *¡Tarea creada!*\n\n📌 *{draft['task_name']}*\n👤 {draft['assignee_name']}  |  📅 {due_str}",
+        f"🎉 *¡Tarea creada!*\n\n📌 *{draft['task_name']}*\n👤 {draft['assignee_name'].split('(')[0].strip()}  |  📅 {due_str}{area_info}",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Menú", callback_data="menu")]]),
     )
@@ -3629,6 +3764,7 @@ def main():
             CommandHandler("tarea", crear_tarea_start),
             CallbackQueryHandler(crear_tarea_start,          pattern="^crear_tarea_start$"),
             CallbackQueryHandler(leader_create_task_start,   pattern="^leader_create_task$"),
+            CommandHandler("cancel", cancel_conv),
         ],
         states={
             TASK_ASSIGNEE: [
@@ -3669,8 +3805,9 @@ def main():
             ],
         },
         fallbacks=[
-            CallbackQueryHandler(show_main_menu, pattern="^menu$"),
-            CommandHandler("menu", cmd_menu),
+            CallbackQueryHandler(cancel_conv, pattern="^menu$"),
+            CommandHandler("menu",   cmd_menu),
+            CommandHandler("cancel", cancel_conv),
         ],
         per_message=False,
     )
@@ -3694,8 +3831,9 @@ def main():
             ],
         },
         fallbacks=[
-            CallbackQueryHandler(show_main_menu, pattern="^menu$"),
-            CommandHandler("menu", cmd_menu),
+            CallbackQueryHandler(cancel_conv, pattern="^menu$"),
+            CommandHandler("menu",   cmd_menu),
+            CommandHandler("cancel", cancel_conv),
         ],
         per_message=False,
     )
@@ -3721,8 +3859,9 @@ def main():
             ],
         },
         fallbacks=[
-            CallbackQueryHandler(show_main_menu, pattern="^menu$"),
-            CommandHandler("menu", cmd_menu),
+            CallbackQueryHandler(cancel_conv, pattern="^menu$"),
+            CommandHandler("menu",   cmd_menu),
+            CommandHandler("cancel", cancel_conv),
         ],
         per_message=False,
     )
@@ -3743,8 +3882,9 @@ def main():
             ],
         },
         fallbacks=[
-            CallbackQueryHandler(show_main_menu, pattern="^menu$"),
-            CommandHandler("menu", cmd_menu),
+            CallbackQueryHandler(cancel_conv, pattern="^menu$"),
+            CommandHandler("menu",   cmd_menu),
+            CommandHandler("cancel", cancel_conv),
         ],
         per_message=False,
     )
@@ -3758,8 +3898,9 @@ def main():
             ],
         },
         fallbacks=[
-            CallbackQueryHandler(show_main_menu, pattern="^menu$"),
-            CommandHandler("menu", cmd_menu),
+            CallbackQueryHandler(cancel_conv, pattern="^menu$"),
+            CommandHandler("menu",   cmd_menu),
+            CommandHandler("cancel", cancel_conv),
         ],
         per_message=False,
     )

@@ -149,12 +149,16 @@ async def asana_task_completed(gid: str) -> bool:
 
 @app.get("/api/summary")
 async def api_summary(_=Depends(check_auth)):
-    team   = load_team()
-    today  = datetime.now(TZ).strftime("%Y-%m-%d")
-    result = []
+    team     = load_team()
+    today    = datetime.now(TZ).strftime("%Y-%m-%d")
+    statuses = _load_task_statuses()
+    result   = []
     for tg_id, info in team.items():
         tasks   = await asana_get_tasks(info["asana_gid"])
         overdue = sum(1 for t in tasks if t.get("due_on") and t["due_on"] < today)
+        # Añadir estado local a cada tarea
+        for t in tasks:
+            t["status"] = statuses.get(t["gid"], "pending")
         result.append({
             "tg_id": tg_id, "name": info["name"], "asana_gid": info["asana_gid"],
             "initials": get_initials(info["name"]), "color": get_area_color(info["name"]),
@@ -596,6 +600,79 @@ async def save_permissions_endpoint(request: Request, _=Depends(check_auth)):
 async def health():
     return {"status": "ok"}
 
+# ── Crear tarea desde la UI ────────────────────────────────────────────────────
+
+@app.post("/api/tasks")
+async def create_task_endpoint(request: Request, _=Depends(check_auth)):
+    """Crea una tarea en Asana desde el dashboard."""
+    body = await request.json()
+    task_name      = body.get("name", "").strip()
+    assignee_tg_id = int(body.get("assignee_tg_id", 0))
+    due_on         = body.get("due_on") or None
+    notes          = body.get("notes") or None
+
+    if not task_name or not assignee_tg_id:
+        raise HTTPException(400, "name y assignee_tg_id son obligatorios")
+
+    team = load_team()
+    if assignee_tg_id not in team:
+        raise HTTPException(400, "Responsable no encontrado en el equipo")
+
+    asana_gid = team[assignee_tg_id]["asana_gid"]
+
+    payload: dict = {"name": asana_gid, "workspace": ASANA_WORKSPACE, "assignee": asana_gid}
+    if due_on:  payload["due_on"] = due_on
+    if notes:   payload["notes"]  = notes
+    payload["name"] = task_name  # fix overwrite
+
+    try:
+        r = await http_client.post(
+            f"{ASANA_BASE}/tasks",
+            headers={"Authorization": f"Bearer {ASANA_TOKEN}", "Content-Type": "application/json"},
+            json={"data": payload},
+            timeout=15,
+        )
+        r.raise_for_status()
+        task_gid = r.json().get("data", {}).get("gid", "")
+    except Exception as e:
+        raise HTTPException(500, f"Error Asana: {e}")
+
+    return {"ok": True, "gid": task_gid, "name": task_name}
+
+# ── Estado de tarea (tracking local en DB) ────────────────────────────────────
+
+_STATUS_LABELS = {
+    "pending":     "⏳ Pendiente",
+    "in_progress": "🔄 En progreso",
+    "review":      "👁 Revisión",
+}
+
+def _load_task_statuses() -> dict:
+    from db import db_get
+    return db_get("task_statuses") or {}
+
+def _save_task_statuses(statuses: dict):
+    from db import db_set
+    db_set("task_statuses", statuses)
+
+@app.get("/api/task-statuses")
+async def get_task_statuses(_=Depends(check_auth)):
+    return _load_task_statuses()
+
+@app.put("/api/tasks/{task_gid}/status")
+async def update_task_status(task_gid: str, request: Request, _=Depends(check_auth)):
+    body    = await request.json()
+    status  = body.get("status", "pending")
+    if status not in _STATUS_LABELS:
+        raise HTTPException(400, f"Estado inválido: {status}")
+    statuses = _load_task_statuses()
+    if status == "pending":
+        statuses.pop(task_gid, None)  # pending es el default, no necesita entrada
+    else:
+        statuses[task_gid] = status
+    _save_task_statuses(statuses)
+    return {"ok": True, "status": status, "label": _STATUS_LABELS[status]}
+
 # ══════════════════════════════════════════════════════════════════════════════
 # HTML
 # ══════════════════════════════════════════════════════════════════════════════
@@ -785,7 +862,10 @@ select.form-input{cursor:pointer}
   <div class="page-header">
     <div><div class="page-title">Dashboard</div>
     <div class="page-sub" id="dash-ts">Cargando desde Asana...</div></div>
-    <button class="btn" onclick="loadDashboard()">↻ Actualizar</button>
+    <div class="btn-group">
+      <button class="btn btn-primary" onclick="openNewTaskModal()">➕ Nueva tarea</button>
+      <button class="btn" onclick="loadDashboard()">↻ Actualizar</button>
+    </div>
   </div>
   <div id="dash-cards" class="summary-grid"><div class="loader"><span class="spin">⟳</span></div></div>
   <div class="section-title" id="dash-tasks-title">📋 Tareas por área</div>
@@ -995,6 +1075,35 @@ select.form-input{cursor:pointer}
   </div>
 </div>
 
+<!-- ═══ MODAL: Nueva tarea desde dashboard ═══ -->
+<div class="modal-overlay" id="new-task-modal">
+  <div class="modal">
+    <div class="modal-title">➕ Nueva tarea</div>
+    <div class="modal-body">
+      <div>
+        <label class="form-label">Nombre de la tarea *</label>
+        <input class="form-input" id="nt-name" placeholder="Ej: Llamar al cliente García">
+      </div>
+      <div>
+        <label class="form-label">Responsable *</label>
+        <select class="form-input" id="nt-assignee"></select>
+      </div>
+      <div>
+        <label class="form-label">Fecha límite</label>
+        <input class="form-input" id="nt-due" type="date">
+      </div>
+      <div>
+        <label class="form-label">Descripción (opcional)</label>
+        <textarea class="form-input" id="nt-notes" rows="3" placeholder="Contexto, instrucciones..." style="resize:vertical"></textarea>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal('new-task-modal')">Cancelar</button>
+      <button class="btn btn-primary" onclick="submitNewTask()">Crear tarea</button>
+    </div>
+  </div>
+</div>
+
 <!-- ═══ MODAL: Nueva área ═══ -->
 <div class="modal-overlay" id="add-area-modal">
   <div class="modal">
@@ -1134,13 +1243,33 @@ function avt(initials, color, size=36, fs=12) {
 }
 
 /* ══════════ DASHBOARD ══════════ */
+const STATUS_CYCLE  = ['pending','in_progress','review'];
+const STATUS_LABELS = {pending:'⏳ Pendiente', in_progress:'🔄 En progreso', review:'👁 Revisión'};
+const STATUS_COLORS = {pending:'#6B7280', in_progress:'#2563EB', review:'#D97706'};
+
+async function cycleStatus(gid, btn) {
+  const cur  = btn.dataset.status || 'pending';
+  const idx  = STATUS_CYCLE.indexOf(cur);
+  const next = STATUS_CYCLE[(idx + 1) % STATUS_CYCLE.length];
+  btn.disabled = true;
+  try {
+    await api('PUT', `/api/tasks/${gid}/status`, {status: next});
+    btn.dataset.status = next;
+    btn.textContent    = STATUS_LABELS[next];
+    btn.style.color    = STATUS_COLORS[next];
+  } catch(e) { toast('Error: ' + e.message, false); }
+  btn.disabled = false;
+}
+
 function _personBlock(p) {
   const rows = p.tasks.map(t => {
-    const od = t.due_on && t.due_on < TODAY;
+    const od  = t.due_on && t.due_on < TODAY;
+    const st  = t.status || 'pending';
     return `<div class="task-row" id="tr-${t.gid}">
       <span class="task-name">${t.name}</span>
       <span class="task-due${od?' overdue':''}">${fmt(t.due_on)}</span>
       ${t.permalink_url?`<a class="task-link" href="${t.permalink_url}" target="_blank">↗</a>`:''}
+      <button class="btn btn-sm" style="font-size:11px;color:${STATUS_COLORS[st]};min-width:90px" data-status="${st}" onclick="cycleStatus('${t.gid}',this)" title="Cambiar estado">${STATUS_LABELS[st]}</button>
       <button class="btn btn-sm btn-success" onclick="completarTarea('${t.gid}',this)" title="Marcar completada">✓</button>
       <button class="btn btn-sm btn-danger" onclick="eliminarTarea('${t.gid}','${t.name.replace(/'/g,'')}',this)" title="Eliminar">🗑</button>
     </div>`;
@@ -1886,6 +2015,35 @@ document.querySelectorAll('.modal-overlay').forEach(o =>
 );
 
 /* ── Init ── */
+/* ══════════ NUEVA TAREA DESDE DASHBOARD ══════════ */
+function openNewTaskModal() {
+  document.getElementById('nt-name').value  = '';
+  document.getElementById('nt-due').value   = '';
+  document.getElementById('nt-notes').value = '';
+  document.getElementById('nt-assignee').innerHTML = teamCache.map(m =>
+    `<option value="${m.tg_id}">${m.name.split('(')[0].trim()} — ${(m.name.match(/\((.+)\)/)||['',''])[1]}</option>`
+  ).join('');
+  document.getElementById('new-task-modal').classList.add('open');
+  setTimeout(() => document.getElementById('nt-name').focus(), 100);
+}
+
+async function submitNewTask() {
+  const name        = document.getElementById('nt-name').value.trim();
+  const assignee_id = parseInt(document.getElementById('nt-assignee').value);
+  const due         = document.getElementById('nt-due').value;
+  const notes       = document.getElementById('nt-notes').value.trim();
+  if (!name) { toast('Escribe el nombre de la tarea', false); return; }
+  const body = { name, assignee_tg_id: assignee_id };
+  if (due)   body.due_on = due;
+  if (notes) body.notes  = notes;
+  try {
+    const res = await api('POST', '/api/tasks', body);
+    toast(`✅ Tarea "${res.name}" creada`);
+    closeModal('new-task-modal');
+    loadDashboard();
+  } catch(e) { toast('Error: ' + e.message, false); }
+}
+
 /* ══════════ PERMISOS ══════════ */
 const PERM_LABELS = {
   leader_can_create_tasks:       'Líderes pueden crear tareas para su equipo',
