@@ -16,12 +16,14 @@ import os
 import json
 import logging
 import secrets
+import hmac
+import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 import pytz
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
@@ -637,22 +639,31 @@ async def asana_webhook_receiver(request: Request):
       1. Handshake inicial: Asana envía X-Hook-Secret → devolvemos el mismo header.
       2. Eventos: procesamos task.added y notificamos por Telegram.
     """
+    logger.info(f"Webhook Asana — método: {request.method}, headers: {dict(request.headers)}")
+
     # ── Handshake ─────────────────────────────────────────────────────────────
-    hook_secret = request.headers.get("X-Hook-Secret")
+    hook_secret = request.headers.get("X-Hook-Secret") or request.headers.get("x-hook-secret")
     if hook_secret:
-        from db import db_set
-        db_set("asana_webhook_secret", hook_secret)
+        try:
+            from db import db_set
+            db_set("asana_webhook_secret", hook_secret)
+        except Exception as e:
+            logger.warning(f"Webhook: no se pudo guardar secret en DB: {e}")
         logger.info("✅ Webhook Asana: handshake completado")
-        from fastapi.responses import Response as FR
-        return FR(headers={"X-Hook-Secret": hook_secret})
+        return Response(
+            status_code=200,
+            headers={"X-Hook-Secret": hook_secret},
+        )
 
     # ── Verificar firma ───────────────────────────────────────────────────────
     body = await request.body()
     sig  = request.headers.get("X-Hook-Signature", "")
-    from db import db_get
-    secret = db_get("asana_webhook_secret") or ""
+    try:
+        from db import db_get
+        secret = db_get("asana_webhook_secret") or ""
+    except Exception:
+        secret = ""
     if secret and sig:
-        import hmac, hashlib
         expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig, expected):
             logger.warning("Webhook Asana: firma inválida — ignorando")
