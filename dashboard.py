@@ -36,6 +36,7 @@ ASANA_WORKSPACE = os.environ.get("ASANA_WORKSPACE_ID", "")
 TIMEZONE        = os.environ.get("TIMEZONE", "America/Caracas")
 DASHBOARD_PASS  = os.environ.get("DASHBOARD_PASSWORD", "")
 MANAGER_TG_ID   = int(os.environ.get("MANAGER_CHAT_ID", "0"))
+TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "")
 TZ              = pytz.timezone(TIMEZONE)
 CFG_FILE        = BASE_DIR / "dashboard_config.json"
 
@@ -600,6 +601,202 @@ async def save_permissions_endpoint(request: Request, _=Depends(check_auth)):
 async def health():
     return {"status": "ok"}
 
+# ══════════════════════════════════════════════════════════════════════════════
+# WEBHOOKS DE ASANA — notificaciones en tiempo real
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _notified_tasks() -> set:
+    from db import db_get
+    return set(db_get("notified_tasks") or [])
+
+def _save_notified(gids: set):
+    from db import db_set
+    # Conservar máximo 10 000 GIDs para no crecer indefinidamente
+    db_set("notified_tasks", list(gids)[-10_000:])
+
+async def _telegram_notify(chat_id: int, text: str, keyboard: dict | None = None):
+    """Envía mensaje de Telegram directo via Bot API (sin necesitar el worker)."""
+    if not TELEGRAM_TOKEN:
+        logger.warning("TELEGRAM_TOKEN no configurado en web service — no se puede notificar")
+        return
+    payload: dict = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if keyboard:
+        payload["reply_markup"] = json.dumps(keyboard)
+    try:
+        await http_client.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json=payload, timeout=10,
+        )
+    except Exception as e:
+        logger.error(f"Error enviando TG webhook-notif a {chat_id}: {e}")
+
+@app.post("/api/webhooks/asana")
+async def asana_webhook_receiver(request: Request):
+    """
+    Receptor de eventos Asana. Dos modos:
+      1. Handshake inicial: Asana envía X-Hook-Secret → devolvemos el mismo header.
+      2. Eventos: procesamos task.added y notificamos por Telegram.
+    """
+    # ── Handshake ─────────────────────────────────────────────────────────────
+    hook_secret = request.headers.get("X-Hook-Secret")
+    if hook_secret:
+        from db import db_set
+        db_set("asana_webhook_secret", hook_secret)
+        logger.info("✅ Webhook Asana: handshake completado")
+        from fastapi.responses import Response as FR
+        return FR(headers={"X-Hook-Secret": hook_secret})
+
+    # ── Verificar firma ───────────────────────────────────────────────────────
+    body = await request.body()
+    sig  = request.headers.get("X-Hook-Signature", "")
+    from db import db_get
+    secret = db_get("asana_webhook_secret") or ""
+    if secret and sig:
+        import hmac, hashlib
+        expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            logger.warning("Webhook Asana: firma inválida — ignorando")
+            raise HTTPException(400, "Invalid signature")
+
+    # ── Procesar eventos ──────────────────────────────────────────────────────
+    try:
+        payload = json.loads(body)
+    except Exception:
+        return {"ok": True}
+
+    events = payload.get("events", [])
+    if not events:
+        return {"ok": True}
+
+    team       = load_team()
+    gid_to_tg  = {info["asana_gid"]: tg_id  for tg_id, info in team.items()}
+    gid_to_name= {info["asana_gid"]: info["name"] for _, info in team.items()}
+    notified   = _notified_tasks()
+    changed    = False
+
+    for event in events:
+        res = event.get("resource", {})
+        if res.get("resource_type") != "task":
+            continue
+        if event.get("action") not in ("added", "changed"):
+            continue
+
+        task_gid    = res.get("gid", "")
+        creator_gid = (event.get("user") or {}).get("gid", "")
+
+        if not task_gid or task_gid in notified:
+            continue
+
+        # Obtener detalles de la tarea
+        try:
+            r = await http_client.get(
+                f"{ASANA_BASE}/tasks/{task_gid}",
+                headers={"Authorization": f"Bearer {ASANA_TOKEN}"},
+                params={"opt_fields": "gid,name,assignee,due_on,completed,permalink_url"},
+                timeout=10,
+            )
+            task = r.json().get("data", {})
+        except Exception as e:
+            logger.error(f"Webhook: error obteniendo tarea {task_gid}: {e}")
+            continue
+
+        if not task or task.get("completed"):
+            notified.add(task_gid)
+            changed = True
+            continue
+
+        assignee_gid = (task.get("assignee") or {}).get("gid", "")
+        if not assignee_gid:
+            continue
+
+        tg_id = gid_to_tg.get(assignee_gid)
+        if not tg_id:
+            continue
+
+        # ── Filtro: la persona se asignó la tarea a sí misma → no notificar ──
+        if creator_gid and creator_gid == assignee_gid:
+            logger.info(f"Webhook: {assignee_gid} creó tarea propia — sin notif")
+            notified.add(task_gid)
+            changed = True
+            continue
+
+        # ── Enviar notificación Telegram ──────────────────────────────────────
+        first = get_first_name(gid_to_name.get(assignee_gid, ""))
+        due   = f"\n📅 Vence: *{task['due_on']}*" if task.get("due_on") else ""
+        link  = f"\n🔗 {task['permalink_url']}" if task.get("permalink_url") else ""
+        await _telegram_notify(
+            tg_id,
+            f"🔔 *¡Nueva tarea, {first}!*\n\n📌 *{task['name']}*{due}{link}",
+            {"inline_keyboard": [[{"text": "📋 Ver mis tareas", "callback_data": "ver_tareas"}]]},
+        )
+        notified.add(task_gid)
+        changed = True
+        logger.info(f"Webhook: notificado {first} — {task['name']}")
+
+    if changed:
+        _save_notified(notified)
+
+    return {"ok": True}
+
+@app.post("/api/webhooks/register")
+async def register_asana_webhook(request: Request, _=Depends(check_auth)):
+    """
+    Registra el webhook en Asana.
+    Body: {"url": "https://tu-dominio.railway.app/api/webhooks/asana"}
+    """
+    body = await request.json()
+    url  = body.get("url", "").strip()
+    if not url:
+        raise HTTPException(400, "url es obligatoria")
+    if not ASANA_TOKEN or not ASANA_WORKSPACE:
+        raise HTTPException(503, "ASANA_TOKEN / ASANA_WORKSPACE_ID no configurados")
+    try:
+        r = await http_client.post(
+            f"{ASANA_BASE}/webhooks",
+            headers={"Authorization": f"Bearer {ASANA_TOKEN}", "Content-Type": "application/json"},
+            json={"data": {
+                "resource": ASANA_WORKSPACE,
+                "target":   url,
+                "filters":  [{"resource_type": "task", "action": "added"}],
+            }},
+            timeout=20,
+        )
+        data = r.json()
+        if r.status_code >= 400:
+            msg = (data.get("errors") or [{}])[0].get("message", r.text[:200])
+            raise HTTPException(r.status_code, f"Asana: {msg}")
+        return {"ok": True, "webhook": data.get("data", {})}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.get("/api/webhooks")
+async def list_asana_webhooks(_=Depends(check_auth)):
+    """Lista webhooks activos en Asana para este workspace."""
+    try:
+        r = await http_client.get(
+            f"{ASANA_BASE}/webhooks",
+            headers={"Authorization": f"Bearer {ASANA_TOKEN}"},
+            params={"workspace": ASANA_WORKSPACE, "opt_fields": "gid,resource,target,active"},
+            timeout=10,
+        )
+        return r.json().get("data", [])
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.delete("/api/webhooks/{webhook_gid}")
+async def delete_asana_webhook(webhook_gid: str, _=Depends(check_auth)):
+    try:
+        await http_client.delete(
+            f"{ASANA_BASE}/webhooks/{webhook_gid}",
+            headers={"Authorization": f"Bearer {ASANA_TOKEN}"},
+            timeout=10,
+        )
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
 # ── Crear tarea desde la UI ────────────────────────────────────────────────────
 
 @app.post("/api/tasks")
@@ -966,6 +1163,23 @@ select.form-input{cursor:pointer}
   <div class="info-box" style="margin-top:20px">
     <span>ℹ️</span>
     <div>Los cambios se guardan en <code>dashboard_config.json</code> y sobreescriben las variables de entorno de Railway al próximo inicio del bot. Para revertir a las env vars originales usa "Restaurar env vars".</div>
+  </div>
+
+  <!-- Webhooks -->
+  <div style="margin-top:28px">
+    <div style="font-size:15px;font-weight:700;margin-bottom:4px">⚡ Notificaciones en tiempo real (Webhook Asana)</div>
+    <div style="font-size:12px;color:var(--text2);margin-bottom:14px">
+      El webhook elimina el polling de 5 min y notifica al instante cuando alguien asigna una tarea.
+      No notifica si la persona se asignó la tarea a sí misma.
+      Requiere <code>TELEGRAM_TOKEN</code> en las variables del servicio <strong>web</strong>.
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+      <input class="form-input" id="wh-url" placeholder="https://tu-app.railway.app/api/webhooks/asana" style="flex:1;min-width:260px">
+      <button class="btn btn-primary" onclick="registerWebhook()">Registrar webhook</button>
+      <button class="btn" onclick="loadWebhooks()">↻ Ver activos</button>
+    </div>
+    <div id="wh-status" style="font-size:12px;color:var(--text2)">Haz clic en "Ver activos" para listar los webhooks registrados.</div>
+    <div id="wh-list" style="margin-top:10px"></div>
   </div>
 </div>
 
@@ -2083,6 +2297,56 @@ async function savePermisos() {
   } catch(e) {
     toast('Error: ' + e.message, false);
   }
+}
+
+/* ══════════ WEBHOOKS ══════════ */
+async function registerWebhook() {
+  const url = document.getElementById('wh-url').value.trim();
+  if (!url) { toast('Escribe la URL del webhook', false); return; }
+  const st = document.getElementById('wh-status');
+  st.textContent = 'Registrando...';
+  try {
+    const r = await api('POST', '/api/webhooks/register', { url });
+    st.innerHTML = `✅ Webhook registrado — GID: <code>${r.webhook?.gid || '?'}</code>`;
+    toast('✅ Webhook de Asana registrado');
+    loadWebhooks();
+  } catch(e) {
+    st.textContent = '❌ Error: ' + e.message;
+    toast('Error: ' + e.message, false);
+  }
+}
+
+async function loadWebhooks() {
+  const list = document.getElementById('wh-list');
+  const st   = document.getElementById('wh-status');
+  list.innerHTML = '<span style="color:var(--text2);font-size:12px">Cargando...</span>';
+  try {
+    const hooks = await api('GET', '/api/webhooks');
+    if (!hooks.length) {
+      list.innerHTML = '';
+      st.textContent = 'No hay webhooks registrados.';
+      return;
+    }
+    st.textContent = `${hooks.length} webhook(s) activo(s):`;
+    list.innerHTML = hooks.map(h => `
+      <div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border);font-size:12px">
+        <span style="flex:1;font-family:monospace;color:var(--text2)">${h.target || h.gid}</span>
+        <span style="color:${h.active?'#1D9E75':'#B91C1C'}">${h.active?'✅ Activo':'❌ Inactivo'}</span>
+        <button class="btn btn-sm btn-danger" onclick="deleteWebhook('${h.gid}',this)">✕</button>
+      </div>`).join('');
+  } catch(e) {
+    list.innerHTML = `<p style="color:var(--danger);font-size:12px">Error: ${e.message}</p>`;
+  }
+}
+
+async function deleteWebhook(gid, btn) {
+  if (!confirm('¿Eliminar este webhook?')) return;
+  btn.disabled = true;
+  try {
+    await api('DELETE', `/api/webhooks/${gid}`);
+    toast('🗑 Webhook eliminado');
+    loadWebhooks();
+  } catch(e) { toast('Error: ' + e.message, false); btn.disabled = false; }
 }
 
 loadDashboard();

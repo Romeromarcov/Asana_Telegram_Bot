@@ -2049,32 +2049,76 @@ async def job_daily_report(context: ContextTypes.DEFAULT_TYPE):
 
 # ── DETECCIÓN DE TAREAS NUEVAS ─────────────────────────────────────────────────
 
+async def _get_task_creator(task_gid: str) -> str:
+    """Devuelve el asana_gid del usuario que creó la tarea, o '' si no se puede obtener."""
+    try:
+        from utils import http_client, ASANA_BASE
+        r = await http_client.get(
+            f"{ASANA_BASE}/tasks/{task_gid}",
+            headers={"Authorization": f"Bearer {ASANA_TOKEN}"},
+            params={"opt_fields": "created_by"},
+            timeout=8,
+        )
+        return r.json().get("data", {}).get("created_by", {}).get("gid", "")
+    except Exception:
+        return ""
+
 async def job_check_new_tasks(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Respaldo de detección de tareas nuevas (cada CHECK_INTERVAL_MINUTES).
+    El webhook de Asana es el mecanismo primario; este job actúa como fallback.
+    - Omite tareas ya notificadas por el webhook (DB 'notified_tasks').
+    - Omite tareas que la persona se asignó a sí misma.
+    """
+    from db import db_get, db_set
+    notified_db = set(db_get("notified_tasks") or [])
+
     team = load_team()
     for tg_id, info in team.items():
         asana_gid = info["asana_gid"]
         try:
             current_tasks = await get_pending_tasks(asana_gid)
             current_gids  = {t["gid"] for t in current_tasks}
+
             if asana_gid not in known_tasks:
+                # Primera vez que vemos este miembro: registrar sin notificar
                 known_tasks[asana_gid] = current_gids
                 continue
+
             new_tasks = [t for t in current_tasks if t["gid"] not in known_tasks[asana_gid]]
+            notified_now = []
             for task in new_tasks:
-                due = f"\n📅 Vence: *{task['due_on']}*" if task.get("due_on") else ""
+                gid = task["gid"]
+                # Saltar si el webhook ya notificó esta tarea
+                if gid in notified_db:
+                    continue
+                # Saltar si la persona se asignó la tarea a sí misma
+                creator = await _get_task_creator(gid)
+                if creator and creator == asana_gid:
+                    logger.info(f"Fallback: {info['name']} creó tarea propia — sin notif")
+                    notified_db.add(gid)
+                    continue
+                due      = f"\n📅 Vence: *{task['due_on']}*" if task.get("due_on") else ""
                 keyboard = InlineKeyboardMarkup([[
                     InlineKeyboardButton("📋 Ver mis tareas", callback_data="ver_tareas")
                 ]])
                 await context.bot.send_message(
-                    chat_id     = tg_id,
-                    text        = f"🔔 *¡Nueva tarea, {get_first_name(info['name'])}!*\n\n📌 *{task['name']}*{due}",
-                    reply_markup= keyboard,
-                    parse_mode  = "Markdown")
+                    chat_id      = tg_id,
+                    text         = f"🔔 *¡Nueva tarea, {get_first_name(info['name'])}!*\n\n📌 *{task['name']}*{due}",
+                    reply_markup = keyboard,
+                    parse_mode   = "Markdown",
+                )
+                notified_db.add(gid)
+                notified_now.append(gid)
+
             known_tasks[asana_gid] = current_gids
-            if new_tasks:
+            if notified_now:
                 save_known_tasks()
         except Exception as e:
             logger.error(f"Error revisando {info['name']}: {e}")
+
+    # Actualizar set compartido con el web service
+    db_set("notified_tasks", list(notified_db)[-10_000:])
 
 # ── COMANDOS ───────────────────────────────────────────────────────────────────
 
