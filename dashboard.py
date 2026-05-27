@@ -2301,8 +2301,13 @@ async function savePermisos() {
 
 /* ══════════ WEBHOOKS ══════════ */
 async function registerWebhook() {
-  const url = document.getElementById('wh-url').value.trim();
+  let url = document.getElementById('wh-url').value.trim();
   if (!url) { toast('Escribe la URL del webhook', false); return; }
+  // Auto-completar path si el usuario sólo pegó la URL base
+  if (!url.includes('/api/webhooks/asana')) {
+    url = url.replace(/\/$/, '') + '/api/webhooks/asana';
+    document.getElementById('wh-url').value = url;
+  }
   const st = document.getElementById('wh-status');
   st.textContent = 'Registrando...';
   try {
