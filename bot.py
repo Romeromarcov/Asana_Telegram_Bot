@@ -2033,8 +2033,6 @@ async def _send_leader_area_reports(bot) -> None:
 async def job_morning(context: ContextTypes.DEFAULT_TYPE):
     team = load_team()
     for tg_id, info in team.items():
-        if tg_id == MANAGER_CHAT_ID:
-            continue
         tasks = await get_pending_tasks(info["asana_gid"])
         await send_reminder(context.bot, tg_id, info["name"], tasks, "mañana")
     await _send_leader_area_reports(context.bot)
@@ -2042,8 +2040,6 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
 async def job_afternoon(context: ContextTypes.DEFAULT_TYPE):
     team = load_team()
     for tg_id, info in team.items():
-        if tg_id == MANAGER_CHAT_ID:
-            continue
         tasks = await get_pending_tasks(info["asana_gid"])
         await send_reminder(context.bot, tg_id, info["name"], tasks, "tarde")
     await _send_leader_area_reports(context.bot)
@@ -2056,8 +2052,6 @@ async def job_daily_report(context: ContextTypes.DEFAULT_TYPE):
 async def job_check_new_tasks(context: ContextTypes.DEFAULT_TYPE):
     team = load_team()
     for tg_id, info in team.items():
-        if tg_id == MANAGER_CHAT_ID:
-            continue
         asana_gid = info["asana_gid"]
         try:
             current_tasks = await get_pending_tasks(asana_gid)
