@@ -758,37 +758,82 @@ async def asana_webhook_receiver(request: Request):
 @app.post("/api/webhooks/register")
 async def register_asana_webhook(request: Request, _=Depends(check_auth)):
     """
-    Registra el webhook en Asana.
+    Registra webhooks de Asana a nivel de proyecto (los eventos de task no
+    se propagan a webhooks de workspace — doc Asana).
+    Itera sobre todos los project_gid configurados y registra uno por proyecto.
     Body: {"url": "https://tu-dominio.railway.app/api/webhooks/asana"}
     """
     body = await request.json()
     url  = body.get("url", "").strip()
     if not url:
         raise HTTPException(400, "url es obligatoria")
-    if not ASANA_TOKEN or not ASANA_WORKSPACE:
-        raise HTTPException(503, "ASANA_TOKEN / ASANA_WORKSPACE_ID no configurados")
-    try:
-        r = await http_client.post(
-            f"{ASANA_BASE}/webhooks",
-            headers={"Authorization": f"Bearer {ASANA_TOKEN}", "Content-Type": "application/json"},
-            json={"data": {
-                "resource": ASANA_WORKSPACE,
-                "target":   url,
-                # Asana workspace-scope whitelist: solo resource_type sin action,
-                # o action="changed" con fields. Sin action = capta todos los eventos de task.
-                "filters":  [{"resource_type": "task"}],
-            }},
-            timeout=20,
-        )
-        data = r.json()
-        if r.status_code >= 400:
-            msg = (data.get("errors") or [{}])[0].get("message", r.text[:200])
-            raise HTTPException(r.status_code, f"Asana: {msg}")
-        return {"ok": True, "webhook": data.get("data", {})}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, str(e))
+    if not ASANA_TOKEN:
+        raise HTTPException(503, "ASANA_TOKEN no configurado")
+
+    # Obtener project_gids únicos del store
+    from db import db_get
+    projects_data = db_get("projects") or {}
+    project_gids: set[str] = set()
+    for cfg in projects_data.values():
+        gid = (cfg or {}).get("project_gid", "")
+        if gid:
+            project_gids.add(gid)
+
+    # Fallback: intentar leer projects.json local
+    if not project_gids:
+        try:
+            import json as _json
+            pfile = BASE_DIR / "projects.json"
+            if pfile.exists():
+                for cfg in _json.loads(pfile.read_text("utf-8")).values():
+                    gid = (cfg or {}).get("project_gid", "")
+                    if gid:
+                        project_gids.add(gid)
+        except Exception:
+            pass
+
+    if not project_gids:
+        raise HTTPException(503, "No hay proyectos configurados. Asegúrate de que el bot haya creado al menos un proyecto en Asana.")
+
+    registered = []
+    errors     = []
+    headers    = {"Authorization": f"Bearer {ASANA_TOKEN}", "Content-Type": "application/json"}
+
+    for proj_gid in project_gids:
+        try:
+            r = await http_client.post(
+                f"{ASANA_BASE}/webhooks",
+                headers=headers,
+                json={"data": {
+                    "resource": proj_gid,
+                    "target":   url,
+                    "filters":  [{"resource_type": "task", "action": "added"}],
+                }},
+                timeout=20,
+            )
+            data = r.json()
+            if r.status_code >= 400:
+                msg = (data.get("errors") or [{}])[0].get("message", r.text[:200])
+                # 400 "already exists" es ok — ya hay webhook para este proyecto
+                if "already" in msg.lower() or "duplicate" in msg.lower():
+                    registered.append({"project_gid": proj_gid, "status": "already_exists"})
+                else:
+                    errors.append(f"Proyecto {proj_gid}: {msg}")
+            else:
+                registered.append({"project_gid": proj_gid, "webhook": data.get("data", {}), "status": "created"})
+                logger.info(f"✅ Webhook registrado para proyecto {proj_gid}")
+        except Exception as e:
+            errors.append(f"Proyecto {proj_gid}: {e}")
+
+    if not registered and errors:
+        raise HTTPException(500, " | ".join(errors))
+
+    return {
+        "ok": True,
+        "registered": registered,
+        "errors": errors,
+        "message": f"{len(registered)} webhook(s) registrado(s) en {len(project_gids)} proyecto(s)",
+    }
 
 @app.get("/api/webhooks")
 async def list_asana_webhooks(_=Depends(check_auth)):
@@ -2331,7 +2376,7 @@ async function registerWebhook() {
   st.textContent = 'Registrando...';
   try {
     const r = await api('POST', '/api/webhooks/register', { url });
-    st.innerHTML = `✅ Webhook registrado — GID: <code>${r.webhook?.gid || '?'}</code>`;
+    st.innerHTML = `✅ ${r.message || 'Webhook(s) registrado(s)'}` + (r.errors?.length ? `<br><span style="color:var(--danger)">Errores: ${r.errors.join(' | ')}</span>` : '');
     toast('✅ Webhook de Asana registrado');
     loadWebhooks();
   } catch(e) {
