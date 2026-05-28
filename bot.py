@@ -59,20 +59,53 @@ KNOWN_TASKS_FILE = Path(__file__).parent / "known_tasks.json"
 
 # ── Config desde variables de entorno ─────────────────────────────────────────
 # Los cambios de configuración del panel web se aplican vía env vars en Railway.
-# (Los servicios Web y Worker tienen filesystems separados; dashboard_config.json
-#  escrito por el panel NO llega al Worker → se usa directamente os.environ.)
-TIMEZONE               = os.environ.get("TIMEZONE",               "America/Caracas")
-MORNING_HOUR           = int(os.environ.get("MORNING_HOUR",        "9"))
-MORNING_MIN            = int(os.environ.get("MORNING_MIN",         "0"))
-AFTERNOON_HOUR         = int(os.environ.get("AFTERNOON_HOUR",      "15"))
-AFTERNOON_MIN          = int(os.environ.get("AFTERNOON_MIN",       "0"))
-REPORT_HOUR            = int(os.environ.get("REPORT_HOUR",         "18"))
-REPORT_MIN             = int(os.environ.get("REPORT_MIN",          "0"))
-EVENING_HOUR           = int(os.environ.get("EVENING_HOUR",        "18"))
-EVENING_MIN            = int(os.environ.get("EVENING_MIN",         "0"))
-CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "5"))
+# ── Configuración: env vars como valores por defecto; la DB puede sobreescribir ──
+# La función _load_config() lee de kv_store primero (guardado desde el dashboard)
+# y cae en las env vars si no hay nada en DB. Así no se necesita redeploy.
+
+def _load_config() -> dict:
+    """Lee config desde DB (prioridad) o env vars (fallback)."""
+    cfg = {}
+    try:
+        from db import db_get
+        db_cfg = db_get("config") or {}
+        cfg = {k: v for k, v in db_cfg.items() if v != "" and v is not None}
+    except Exception:
+        pass
+    def _int(key, default):
+        return int(cfg.get(key, os.environ.get(key, default)))
+    def _str(key, default):
+        return str(cfg.get(key, os.environ.get(key, default)))
+    return {
+        "TIMEZONE":               _str("TIMEZONE",               "America/Caracas"),
+        "MORNING_HOUR":           _int("MORNING_HOUR",            "9"),
+        "MORNING_MIN":            _int("MORNING_MIN",             "0"),
+        "AFTERNOON_HOUR":         _int("AFTERNOON_HOUR",          "15"),
+        "AFTERNOON_MIN":          _int("AFTERNOON_MIN",           "0"),
+        "REPORT_HOUR":            _int("REPORT_HOUR",             "18"),
+        "REPORT_MIN":             _int("REPORT_MIN",              "0"),
+        "EVENING_HOUR":           _int("EVENING_HOUR",            "18"),
+        "EVENING_MIN":            _int("EVENING_MIN",             "0"),
+        "CHECK_INTERVAL_MINUTES": _int("CHECK_INTERVAL_MINUTES",  "5"),
+    }
+
+_cfg = _load_config()
+TIMEZONE               = _cfg["TIMEZONE"]
+MORNING_HOUR           = _cfg["MORNING_HOUR"]
+MORNING_MIN            = _cfg["MORNING_MIN"]
+AFTERNOON_HOUR         = _cfg["AFTERNOON_HOUR"]
+AFTERNOON_MIN          = _cfg["AFTERNOON_MIN"]
+REPORT_HOUR            = _cfg["REPORT_HOUR"]
+REPORT_MIN             = _cfg["REPORT_MIN"]
+EVENING_HOUR           = _cfg["EVENING_HOUR"]
+EVENING_MIN            = _cfg["EVENING_MIN"]
+CHECK_INTERVAL_MINUTES = _cfg["CHECK_INTERVAL_MINUTES"]
 
 TZ = pytz.timezone(TIMEZONE)
+
+# Referencias a los jobs diarios para poder reprogramarlos sin reiniciar
+_daily_jobs: dict = {}
+_config_snapshot: str = ""   # hash del último config aplicado
 
 # ── Persistencia de known_tasks (evita re-notificar al reiniciar) ─────────────
 def load_known_tasks() -> dict[str, set]:
@@ -2120,6 +2153,78 @@ async def job_evening_report(context: ContextTypes.DEFAULT_TYPE):
 async def job_daily_report(context: ContextTypes.DEFAULT_TYPE):
     await _send_report(context.bot)
 
+
+# ── Reconfiguración dinámica sin redeploy ──────────────────────────────────────
+
+def _apply_config(cfg: dict):
+    """Actualiza las variables globales con la nueva config."""
+    global MORNING_HOUR, MORNING_MIN, AFTERNOON_HOUR, AFTERNOON_MIN
+    global REPORT_HOUR, REPORT_MIN, EVENING_HOUR, EVENING_MIN
+    global CHECK_INTERVAL_MINUTES, TZ
+    MORNING_HOUR           = int(cfg.get("MORNING_HOUR",           MORNING_HOUR))
+    MORNING_MIN            = int(cfg.get("MORNING_MIN",            MORNING_MIN))
+    AFTERNOON_HOUR         = int(cfg.get("AFTERNOON_HOUR",         AFTERNOON_HOUR))
+    AFTERNOON_MIN          = int(cfg.get("AFTERNOON_MIN",          AFTERNOON_MIN))
+    REPORT_HOUR            = int(cfg.get("REPORT_HOUR",            REPORT_HOUR))
+    REPORT_MIN             = int(cfg.get("REPORT_MIN",             REPORT_MIN))
+    EVENING_HOUR           = int(cfg.get("EVENING_HOUR",           EVENING_HOUR))
+    EVENING_MIN            = int(cfg.get("EVENING_MIN",            EVENING_MIN))
+    CHECK_INTERVAL_MINUTES = int(cfg.get("CHECK_INTERVAL_MINUTES", CHECK_INTERVAL_MINUTES))
+    tz_name = cfg.get("TIMEZONE", "")
+    if tz_name:
+        try:
+            TZ = pytz.timezone(tz_name)
+        except Exception:
+            pass
+
+
+def _reschedule_daily_jobs(jq):
+    """Cancela los jobs diarios actuales y los reprograma con los horarios nuevos."""
+    global _daily_jobs
+    # Cancelar jobs anteriores
+    for name, job in list(_daily_jobs.items()):
+        try:
+            job.schedule_removal()
+        except Exception:
+            pass
+    _daily_jobs = {}
+    # Reprogramar
+    _daily_jobs["morning"]   = jq.run_daily(job_morning,        time(MORNING_HOUR,   MORNING_MIN,   tzinfo=TZ))
+    _daily_jobs["afternoon"] = jq.run_daily(job_afternoon,      time(AFTERNOON_HOUR, AFTERNOON_MIN, tzinfo=TZ))
+    _daily_jobs["evening"]   = jq.run_daily(job_evening_report, time(EVENING_HOUR,   EVENING_MIN,   tzinfo=TZ))
+    _daily_jobs["report"]    = jq.run_daily(job_daily_report,   time(REPORT_HOUR,    REPORT_MIN,    tzinfo=TZ))
+    logger.info(
+        f"⚙️ Jobs reprogramados — mañana:{MORNING_HOUR}:{MORNING_MIN:02d} "
+        f"tarde:{AFTERNOON_HOUR}:{AFTERNOON_MIN:02d} "
+        f"vespertino:{EVENING_HOUR}:{EVENING_MIN:02d} "
+        f"manager:{REPORT_HOUR}:{REPORT_MIN:02d}"
+    )
+
+
+async def job_check_config(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Cada 5 min: comprueba si la config cambió en la DB.
+    Si cambió, actualiza variables globales y reprograma los jobs diarios.
+    No requiere redeploy del Worker.
+    """
+    global _config_snapshot
+    try:
+        from db import db_get
+        cfg = db_get("config") or {}
+    except Exception:
+        return
+    if not cfg:
+        return
+
+    snapshot = str(sorted(cfg.items()))
+    if snapshot == _config_snapshot:
+        return  # Sin cambios
+
+    _apply_config(cfg)
+    _reschedule_daily_jobs(context.job_queue)
+    _config_snapshot = snapshot
+    logger.info("⚙️ Config actualizado desde DB sin redeploy")
+
 # ── DETECCIÓN DE TAREAS NUEVAS ─────────────────────────────────────────────────
 
 async def _get_task_creator(task_gid: str) -> str:
@@ -4031,10 +4136,12 @@ def main():
 
     # ── Jobs programados ───────────────────────────────────────────────────────
     jq = app.job_queue
-    jq.run_daily(job_morning,        time(MORNING_HOUR,   MORNING_MIN,   tzinfo=TZ))
-    jq.run_daily(job_afternoon,      time(AFTERNOON_HOUR, AFTERNOON_MIN, tzinfo=TZ))
-    jq.run_daily(job_evening_report, time(EVENING_HOUR,   EVENING_MIN,   tzinfo=TZ))
-    jq.run_daily(job_daily_report,   time(REPORT_HOUR,    REPORT_MIN,    tzinfo=TZ))
+
+    # Jobs diarios — guardamos referencias para poder reprogramarlos sin redeploy
+    _daily_jobs["morning"]   = jq.run_daily(job_morning,        time(MORNING_HOUR,   MORNING_MIN,   tzinfo=TZ))
+    _daily_jobs["afternoon"] = jq.run_daily(job_afternoon,      time(AFTERNOON_HOUR, AFTERNOON_MIN, tzinfo=TZ))
+    _daily_jobs["evening"]   = jq.run_daily(job_evening_report, time(EVENING_HOUR,   EVENING_MIN,   tzinfo=TZ))
+    _daily_jobs["report"]    = jq.run_daily(job_daily_report,   time(REPORT_HOUR,    REPORT_MIN,    tzinfo=TZ))
 
     # Escalación — corre junto a los recordatorios de mañana y tarde
     jq.run_daily(job_escalation_am,  time(MORNING_HOUR,   MORNING_MIN,   tzinfo=TZ))
@@ -4048,12 +4155,14 @@ def main():
     jq.run_repeating(job_check_new_tasks,           interval=CHECK_INTERVAL_MINUTES * 60, first=10)
     jq.run_repeating(job_process_recurring,         interval=60 * 30, first=30)
     jq.run_repeating(job_check_recurring_completed, interval=60 * 60, first=60)
+    # Detector de cambios de config: cada 5 min sin redeploy
+    jq.run_repeating(job_check_config,              interval=60 * 5,   first=60)
 
     logger.info(
         f"✅ Bot Lubrikca v6.0 listo | "
-        f"Recordatorios: {MORNING_HOUR}:00 y {AFTERNOON_HOUR}:00 | "
-        f"Reporte: {REPORT_HOUR}:00 | Escalación activa | "
-        f"Funciones v6: tarea propia, minuta IA, equipo desde Telegram, NL tasks"
+        f"Recordatorios: {MORNING_HOUR}:{MORNING_MIN:02d} y {AFTERNOON_HOUR}:{AFTERNOON_MIN:02d} | "
+        f"Vespertino: {EVENING_HOUR}:{EVENING_MIN:02d} | "
+        f"Reporte mgr: {REPORT_HOUR}:{REPORT_MIN:02d} | Config dinámica: ON"
     )
     app.run_polling(drop_pending_updates=True)
 

@@ -307,24 +307,34 @@ async def api_config(_=Depends(check_auth)):
 @app.post("/api/config")
 async def save_config(request: Request, _=Depends(check_auth)):
     """
-    Nota: en la arquitectura de dos servicios (Web + Worker), los cambios
-    de configuración deben hacerse en las Variables de Entorno de Railway
-    (servicio Worker) y re-desplegar el Worker para que tengan efecto.
-    Este endpoint es informativo.
+    Guarda la configuración en kv_store (PostgreSQL compartido con el Worker).
+    El Worker detecta el cambio en ~5 minutos y reprograma los jobs sin redeploy.
     """
-    return {
-        "ok": False,
-        "message": (
-            "Para cambiar la configuración ve a Railway → servicio Worker → Variables "
-            "y actualiza las variables de entorno (TIMEZONE, MORNING_HOUR, etc.). "
-            "El Worker se re-desplegará automáticamente."
-        ),
+    body = await request.json()
+    # Validar y limpiar los campos conocidos
+    allowed = {
+        "TIMEZONE", "MORNING_HOUR", "MORNING_MIN", "AFTERNOON_HOUR", "AFTERNOON_MIN",
+        "REPORT_HOUR", "REPORT_MIN", "EVENING_HOUR", "EVENING_MIN", "CHECK_INTERVAL_MINUTES",
     }
+    cfg = {k: v for k, v in body.items() if k in allowed}
+    if not cfg:
+        raise HTTPException(400, "No hay campos válidos para guardar")
+
+    from db import db_set, db_connected
+    if db_connected():
+        db_set("config", cfg)
+        return {"ok": True, "message": "✅ Configuración guardada en DB — el bot la aplicará en ~5 min sin redeploy"}
+    else:
+        # Fallback: guardar en archivo local (dev)
+        CFG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {"ok": True, "message": "✅ Guardado localmente (sin DB). En Railway usa env vars."}
 
 @app.delete("/api/config")
 async def reset_config(_=Depends(check_auth)):
-    """No-op en arquitectura de dos servicios; la config viene de env vars."""
-    return {"ok": True, "message": "La configuración se gestiona via variables de entorno."}
+    """Elimina la config guardada en DB para volver a leer de env vars."""
+    from db import db_set
+    db_set("config", {})
+    return {"ok": True, "message": "Config reseteada — el bot volverá a usar las variables de entorno."}
 
 # ── Recurring: editar ──────────────────────────────────────────────────────────
 @app.put("/api/recurring/{idx}")
@@ -2282,7 +2292,7 @@ async function saveConfig() {
   }
   try {
     await api('POST','/api/config', body);
-    toast('✅ Configuración guardada — aplica en próximo reinicio');
+    toast(r.message || '✅ Configuración guardada');
     loadConfig();
   } catch(e) { toast('Error: ' + e.message, false); }
 }
