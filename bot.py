@@ -68,6 +68,8 @@ AFTERNOON_HOUR         = int(os.environ.get("AFTERNOON_HOUR",      "15"))
 AFTERNOON_MIN          = int(os.environ.get("AFTERNOON_MIN",       "0"))
 REPORT_HOUR            = int(os.environ.get("REPORT_HOUR",         "18"))
 REPORT_MIN             = int(os.environ.get("REPORT_MIN",          "0"))
+EVENING_HOUR           = int(os.environ.get("EVENING_HOUR",        "18"))
+EVENING_MIN            = int(os.environ.get("EVENING_MIN",         "0"))
 CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "5"))
 
 TZ = pytz.timezone(TIMEZONE)
@@ -191,6 +193,23 @@ async def get_pending_tasks(asana_gid: str) -> list:
         "opt_fields": "gid,name,due_on",
     }
     return (await asana_get("/tasks", params)).get("data", [])
+
+async def get_completed_tasks_today(asana_gid: str) -> list:
+    """
+    Devuelve las tareas completadas HOY por asana_gid.
+    Asana filtra con completed_since=<inicio_de_hoy> y retorna tareas
+    completadas desde esa hora; luego filtramos las que completed=True.
+    """
+    today_start = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    today_iso   = today_start.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    params = {
+        "assignee":        asana_gid,
+        "workspace":       ASANA_WORKSPACE,
+        "completed_since": today_iso,
+        "opt_fields":      "gid,name,due_on,completed,completed_at",
+    }
+    data = (await asana_get("/tasks", params)).get("data", [])
+    return [t for t in data if t.get("completed")]
 
 async def create_asana_task(name: str, assignee_gid: str, due_on: str = None,
                              recurrence: str = None, notes: str = None) -> dict:
@@ -2043,6 +2062,60 @@ async def job_afternoon(context: ContextTypes.DEFAULT_TYPE):
         tasks = await get_pending_tasks(info["asana_gid"])
         await send_reminder(context.bot, tg_id, info["name"], tasks, "tarde")
     await _send_leader_area_reports(context.bot)
+
+async def send_evening_report(bot, tg_id: int, name: str, completed: list, pending: list):
+    """Envía a cada persona su reporte de cierre del día."""
+    first     = get_first_name(name)
+    today_str = datetime.now(TZ).strftime("%d/%m/%Y")
+
+    msg = f"🌙 *Reporte del día — {first} — {today_str}*\n\n"
+
+    # ── Completadas ────────────────────────────────────────────────────────────
+    if completed:
+        msg += f"✅ *{len(completed)} tarea(s) completada(s) hoy:*\n"
+        for t in completed:
+            msg += f"  ✓ {t['name']}\n"
+    else:
+        msg += "📭 No completaste ninguna tarea hoy.\n"
+
+    # ── Pendientes para mañana ─────────────────────────────────────────────────
+    if pending:
+        overdue = [t for t in pending if is_overdue(t)]
+        msg += f"\n📋 *{len(pending)} pendiente(s) para mañana:*\n"
+        for t in pending[:6]:
+            due  = f" — _{t['due_on']}_" if t.get("due_on") else ""
+            warn = " ⚠️" if is_overdue(t) else ""
+            msg += f"  • {t['name'][:50]}{due}{warn}\n"
+        if len(pending) > 6:
+            msg += f"  _...y {len(pending) - 6} más_\n"
+        if overdue:
+            msg += f"\n⚠️ *{len(overdue)} tarea(s) vencida(s)*"
+    else:
+        msg += "\n🎉 *¡Sin pendientes para mañana!* Buen trabajo."
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📋 Ver mis tareas",  callback_data="ver_tareas"),
+        InlineKeyboardButton("✅ Completar tarea", callback_data="completar_menu"),
+    ]])
+    try:
+        await bot.send_message(
+            chat_id=tg_id, text=msg, reply_markup=keyboard, parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Error enviando reporte vespertino a {tg_id}: {e}")
+
+
+async def job_evening_report(context: ContextTypes.DEFAULT_TYPE):
+    """Job 6pm: reporte individual de tareas completadas + pendientes del día."""
+    team = load_team()
+    for tg_id, info in team.items():
+        try:
+            completed = await get_completed_tasks_today(info["asana_gid"])
+            pending   = await get_pending_tasks(info["asana_gid"])
+            await send_evening_report(context.bot, tg_id, info["name"], completed, pending)
+        except Exception as e:
+            logger.error(f"job_evening_report — error con {info['name']}: {e}")
+
 
 async def job_daily_report(context: ContextTypes.DEFAULT_TYPE):
     await _send_report(context.bot)
@@ -3960,6 +4033,7 @@ def main():
     jq = app.job_queue
     jq.run_daily(job_morning,        time(MORNING_HOUR,   MORNING_MIN,   tzinfo=TZ))
     jq.run_daily(job_afternoon,      time(AFTERNOON_HOUR, AFTERNOON_MIN, tzinfo=TZ))
+    jq.run_daily(job_evening_report, time(EVENING_HOUR,   EVENING_MIN,   tzinfo=TZ))
     jq.run_daily(job_daily_report,   time(REPORT_HOUR,    REPORT_MIN,    tzinfo=TZ))
 
     # Escalación — corre junto a los recordatorios de mañana y tarde

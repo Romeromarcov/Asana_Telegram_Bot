@@ -298,6 +298,8 @@ async def api_config(_=Depends(check_auth)):
         "AFTERNOON_MIN":          int(ev("AFTERNOON_MIN",       "0")),
         "REPORT_HOUR":            int(ev("REPORT_HOUR",         "18")),
         "REPORT_MIN":             int(ev("REPORT_MIN",          "0")),
+        "EVENING_HOUR":           int(ev("EVENING_HOUR",        "18")),
+        "EVENING_MIN":            int(ev("EVENING_MIN",         "0")),
         "CHECK_INTERVAL_MINUTES": int(ev("CHECK_INTERVAL_MINUTES", "5")),
         "_note": "Para modificar la configuración actualiza las variables de entorno en Railway.",
     }
@@ -2255,6 +2257,14 @@ async function loadConfig() {
         <div style="font-size:11px;color:var(--text3);margin-top:4px">Hora : Minutos</div>
       </div>
       <div class="config-card">
+        <label class="form-label">Reporte vespertino (equipo)</label>
+        <div class="form-row">
+          <input class="form-input" id="eh" name="EVENING_HOUR" type="number" min="0" max="23" value="${c.EVENING_HOUR}" placeholder="18">
+          <input class="form-input" id="em" name="EVENING_MIN"  type="number" min="0" max="59" value="${c.EVENING_MIN}"  placeholder="0">
+        </div>
+        <div style="font-size:11px;color:var(--text3);margin-top:4px">Hora : Minutos — tareas completadas + pendientes</div>
+      </div>
+      <div class="config-card">
         <label class="form-label" for="ci">Intervalo revisión Asana</label>
         <input class="form-input" id="ci" name="CHECK_INTERVAL_MINUTES" type="number" min="1" max="60" value="${c.CHECK_INTERVAL_MINUTES}">
         <div style="font-size:11px;color:var(--text3);margin-top:4px">Minutos entre revisiones</div>
@@ -2264,7 +2274,7 @@ async function loadConfig() {
 
 async function saveConfig() {
   const names = ['TIMEZONE','MORNING_HOUR','MORNING_MIN','AFTERNOON_HOUR','AFTERNOON_MIN',
-                 'REPORT_HOUR','REPORT_MIN','CHECK_INTERVAL_MINUTES'];
+                 'REPORT_HOUR','REPORT_MIN','EVENING_HOUR','EVENING_MIN','CHECK_INTERVAL_MINUTES'];
   const body = {};
   for (const n of names) {
     const el = document.querySelector(`[name="${n}"]`);
