@@ -686,11 +686,17 @@ async def asana_webhook_receiver(request: Request):
     changed    = False
 
     for event in events:
-        res = event.get("resource", {})
+        res    = event.get("resource", {})
+        action = event.get("action", "")
         if res.get("resource_type") != "task":
             continue
-        if event.get("action") not in ("added", "changed"):
+        if action not in ("added", "changed"):
             continue
+        # Para "changed", solo nos importa si cambió el assignee
+        if action == "changed":
+            change_field = (event.get("change") or {}).get("field", "")
+            if change_field != "assignee":
+                continue
 
         task_gid    = res.get("gid", "")
         creator_gid = (event.get("user") or {}).get("gid", "")
@@ -768,7 +774,9 @@ async def register_asana_webhook(request: Request, _=Depends(check_auth)):
             json={"data": {
                 "resource": ASANA_WORKSPACE,
                 "target":   url,
-                "filters":  [{"resource_type": "task", "action": "added"}],
+                # Asana workspace-scope whitelist: solo resource_type sin action,
+                # o action="changed" con fields. Sin action = capta todos los eventos de task.
+                "filters":  [{"resource_type": "task"}],
             }},
             timeout=20,
         )
